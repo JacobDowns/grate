@@ -1,0 +1,15 @@
+name: grate
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - xarray
+  - netcdf4
+  - h5netcdf
+  - mat73
+  - pytorch
+  - gpytorch
+  - geopandas

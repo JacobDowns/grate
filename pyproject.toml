@@ -1,0 +1,18 @@
+[project]
+name = "grate"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "xarray",
+    "netcdf4",
+    "h5netcdf",
+    "mat73",
+    "torch",
+    "gpytorch",
+    "geopandas",
+]

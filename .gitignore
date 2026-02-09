@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+.tox/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+build/
+dist/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Data artifacts (large / generated)
+data/**/*.nc
+data/**/*.h5
+data/**/*.pt
+data/**/*.pth
+data/**/*.npy
+data/**/*.npz
+data/**/*.png
+data/**/*.pdf
+data/**/*.tif
+data/**/*.tiff
+
+# Keep small/raw tabular inputs
+!data/**/*.csv
+!data/**/*.tsv
+
+# ISSM outputs (very large binaries)
+issm_outputs/**/*.mat
+
+# Local exports / archives
+*.zip
+
+# Temporary outputs
+tmp/
+*.log
+

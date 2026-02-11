@@ -1,0 +1,13 @@
+<PAMDataset>
+  <PAMRasterBand band="1">
+    <Description>deglaciation age from Thickness</Description>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">12399.969726562</MDI>
+      <MDI key="STATISTICS_MEAN">3247.4693598202</MDI>
+      <MDI key="STATISTICS_MINIMUM">0</MDI>
+      <MDI key="STATISTICS_STDDEV">5133.053321983</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">69.08</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>

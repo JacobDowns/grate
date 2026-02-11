@@ -1,0 +1,13 @@
+<PAMDataset>
+  <PAMRasterBand band="1">
+    <Description>mean_deglaciation_age</Description>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">12399.96875</MDI>
+      <MDI key="STATISTICS_MEAN">3336.1681733598</MDI>
+      <MDI key="STATISTICS_MINIMUM">0</MDI>
+      <MDI key="STATISTICS_STDDEV">5068.0662579872</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">69.08</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>

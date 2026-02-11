@@ -59,7 +59,7 @@ def main() -> None:
     parser.add_argument("--levels", type=int, default=32, help="Number of colormap levels (default: 32)")
     parser.add_argument(
         "--scale",
-        choices=("global", "per-run"),
+        choices=("global", "per-run"), 
         default="global",
         help="Color scale: shared across runs or per-run (default: global)",
     )

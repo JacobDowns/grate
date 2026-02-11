@@ -1,0 +1,11 @@
+{
+  "ages": "ages",
+  "errors": "errors",
+  "group average": "group_aver",
+  "group std_dev": "group_std_",
+  "group std_error": "group_st_1",
+  "lat": "lat",
+  "lon": "lon",
+  "name": "name",
+  "site": "site"
+}

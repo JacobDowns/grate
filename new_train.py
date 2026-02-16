@@ -19,7 +19,7 @@ class PhysicsInformedGP(gpytorch.models.ExactGP):
         
         # Covariance Module: Models the spatial residual using only (x, y) coordinates
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=2.5, active_dims=[0, 1])
+            gpytorch.kernels.MaternKernel(nu=1.5, active_dims=[0, 1])
         )
 
     def forward(self, x):
@@ -109,8 +109,9 @@ def prepare_training_tensors(ds, x_obs, y_obs, ages_obs, errs_obs, num_pca_modes
     
     ds_sampled = ds.interp(x=x_xr, y=y_xr, method="linear")
     
-    sampled_mean = ds_sampled["deglaciation_age_mean_norm"].values.astype(np.float32)
-    sampled_modes = ds_sampled["pca_mode_norm"].values.astype(np.float32) 
+    # Use the "all" mean/PCA variant produced by snapshot_pca_deglaciation.py.
+    sampled_mean = ds_sampled["deglaciation_age_mean_norm_all"].values.astype(np.float32)
+    sampled_modes = ds_sampled["pca_mode_norm_all"].values.astype(np.float32) 
     
     sampled_modes = sampled_modes.T[:, :num_pca_modes]
     
@@ -172,8 +173,9 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     yg = ds["y"].values
     X_grid, Y_grid = np.meshgrid(xg, yg)
     
-    mean_grid = ds["deglaciation_age_mean_norm"].values.astype(np.float32)
-    modes_grid = ds["pca_mode_norm"].values.astype(np.float32)
+    # Use the "all" mean/PCA variant produced by snapshot_pca_deglaciation.py.
+    mean_grid = ds["deglaciation_age_mean_norm_all"].values.astype(np.float32)
+    modes_grid = ds["pca_mode_norm_all"].values.astype(np.float32)
 
     if "deglaciation_age_norm" not in ds:
         raise KeyError("Dataset is missing 'deglaciation_age_norm' needed to mask output to Holocene max extent.")
@@ -182,7 +184,10 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
 
     # Mask out modern ice cover. If an explicit mask isn't present in the NetCDF, infer it:
     # pixels with deglaciation_age_norm == 0 for every run are still ice-covered at the end of the runs.
-    if "modern_ice_mask" in ds:
+    if "modern_thickness" in ds:
+        thk = ds["modern_thickness"].values.astype(np.float32)
+        modern_ice_mask = np.isfinite(thk) & (thk > 0.0)
+    elif "modern_ice_mask" in ds:
         modern_ice_mask = ds["modern_ice_mask"].values.astype(bool)
     else:
         modern_ice_mask = (ds["deglaciation_age_norm"].max(dim="run").values.astype(np.float32) <= 0.0)
@@ -245,7 +250,7 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     
     n_levels = 16
     age_bounds = np.linspace(min_age, max_age, n_levels + 1, dtype=np.float32)
-    age_cmap = plt.get_cmap("viridis_r", n_levels)
+    age_cmap = plt.get_cmap("magma_r", n_levels)
     age_norm = mcolors.BoundaryNorm(age_bounds, age_cmap.N, clip=True)
     
     im1 = axes[0].pcolormesh(
@@ -286,7 +291,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a GP for deglaciation age with PCA-parameterized mean.")
     parser.add_argument("--pca_path", type=Path, default=Path("data/deglaciation_snapshot_pca.nc"), help="PCA output NetCDF")
     parser.add_argument("--ages_path", type=Path, default=Path("data/ryan_data/all_data.csv"), help="Age observations CSV")
-    parser.add_argument("--num_pca_modes", type=int, default=5, help="Number of PCA modes to use in the mean function")
+    parser.add_argument("--num_pca_modes", type=int, default=15, help="Number of PCA modes to use in the mean function")
     parser.add_argument(
         "--cosmogenic-only",
         action="store_true",
@@ -348,7 +353,7 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=0.033)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     
-    training_iterations = 1000
+    training_iterations = 1500
     print("\nStarting GP Training...")
     
     # Temporarily suppress CG warnings if they still pop up during early optimization

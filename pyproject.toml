@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
+    "pandas",
     "scipy",
     "matplotlib",
     "xarray",
@@ -15,5 +16,6 @@ dependencies = [
     "torch",
     "gpytorch",
     "geopandas",
+    "pyproj",
     "rioxarray>=0.19.0",
 ]

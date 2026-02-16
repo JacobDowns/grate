@@ -1,6 +1,7 @@
 import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import torch
 import gpytorch
 from pathlib import Path
@@ -18,7 +19,7 @@ class PhysicsInformedGP(gpytorch.models.ExactGP):
         
         # Covariance Module: Models the spatial residual using only (x, y) coordinates
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=0.5, active_dims=[0, 1])
+            gpytorch.kernels.MaternKernel(nu=2.5, active_dims=[0, 1])
         )
 
     def forward(self, x):
@@ -31,6 +32,10 @@ class PhysicsInformedGP(gpytorch.models.ExactGP):
 
 def load_pca_dataset(path):
     ds = xr.open_dataset(path, decode_times=False)
+    #print(ds)
+    #ds['deglaciation_age_norm'][0].plot()
+    #plt.show()
+    #quit()
     min_age = ds.attrs.get('age_norm_min_years', 0.0)
     max_age = ds.attrs.get('age_norm_max_years', 1.0)
     print(f"Loaded NetCDF with CRS: {ds.rio.crs}")
@@ -38,10 +43,59 @@ def load_pca_dataset(path):
 
 def load_age_data(path, min_age, max_age):
     df = pd.read_csv(path)
+    if "age_mean" not in df.columns or "age_sd" not in df.columns:
+        raise ValueError(f"{path} must contain columns 'age_mean' and 'age_sd'")
+    if "x_3413" not in df.columns or "y_3413" not in df.columns:
+        raise ValueError(f"{path} must contain columns 'x_3413' and 'y_3413'")
+
+    return df
+
+
+def filter_age_data(
+    df: pd.DataFrame,
+    *,
+    cosmogenic_only: bool,
+    min_quality: str,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    if cosmogenic_only:
+        if "obs_type" not in out.columns:
+            raise ValueError("Requested --cosmogenic-only but input CSV has no 'obs_type' column.")
+        out = out[out["obs_type"].astype(str).str.lower() == "cosmogenic"].copy()
+        return out
+
+    if "quality" not in out.columns:
+        return out
+
+    quality_rank = {"high": 0, "mid": 1, "low": 2}
+    q = str(min_quality).strip().lower()
+    if q not in quality_rank:
+        raise ValueError(f"Unknown min_quality={min_quality!r}; expected one of High/Mid/Low.")
+
+    out["_quality_rank"] = out["quality"].astype(str).str.strip().str.lower().map(quality_rank)
+    out = out[out["_quality_rank"].notna() & (out["_quality_rank"] <= quality_rank[q])].copy()
+    out = out.drop(columns=["_quality_rank"])
+    return out
+
+
+def normalize_age_data(
+    df: pd.DataFrame,
+    min_age: float,
+    max_age: float,
+    *,
+    ages_bp_ref_year: float,
+    model_bp_ref_year: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x = df["x_3413"].to_numpy(dtype=np.float32)
     y = df["y_3413"].to_numpy(dtype=np.float32)
-    ages = df["ages"].to_numpy(dtype=np.float32)
-    errs = df["errors"].to_numpy(dtype=np.float32)
+    ages = df["age_mean"].to_numpy(dtype=np.float32)
+    errs = df["age_sd"].to_numpy(dtype=np.float32)
+
+    # CSV ages are years before `ages_bp_ref_year` (typically 1950).
+    # The model expects years before `model_bp_ref_year` (1850).
+    # Example: 10,000 yr BP (1950) == 9,900 yr BP (1850).
+    ages = ages - np.float32(float(ages_bp_ref_year) - float(model_bp_ref_year))
 
     ages = (ages - min_age) / (max_age - min_age)
     ages = np.clip(ages, 0, 1)
@@ -120,13 +174,29 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     
     mean_grid = ds["deglaciation_age_mean_norm"].values.astype(np.float32)
     modes_grid = ds["pca_mode_norm"].values.astype(np.float32)
+
+    if "deglaciation_age_norm" not in ds:
+        raise KeyError("Dataset is missing 'deglaciation_age_norm' needed to mask output to Holocene max extent.")
+    # Define Holocene maximum ice-sheet extent as pixels where any run has deglaciation_age_norm < 1.
+    holocene_extent = ds["deglaciation_age_norm"].min(dim="run").values.astype(np.float32)  # (y, x)
+
+    # Mask out modern ice cover. If an explicit mask isn't present in the NetCDF, infer it:
+    # pixels with deglaciation_age_norm == 0 for every run are still ice-covered at the end of the runs.
+    if "modern_ice_mask" in ds:
+        modern_ice_mask = ds["modern_ice_mask"].values.astype(bool)
+    else:
+        modern_ice_mask = (ds["deglaciation_age_norm"].max(dim="run").values.astype(np.float32) <= 0.0)
     
     X_flat = X_grid.flatten()
     Y_flat = Y_grid.flatten()
     mean_flat = mean_grid.flatten()
     modes_flat = modes_grid.reshape(modes_grid.shape[0], -1).T[:, :num_pca_modes]
+    extent_flat = holocene_extent.flatten()
+    modern_ice_flat = modern_ice_mask.flatten()
     
     valid_mask = ~np.isnan(mean_flat) & ~np.isnan(modes_flat).any(axis=1)
+    valid_mask &= np.isfinite(extent_flat) & (extent_flat < 1.0)
+    valid_mask &= ~modern_ice_flat
     
     # Scale test grid coordinates using the exact same mean/std from training
     coords_raw = np.column_stack((X_flat[valid_mask], Y_flat[valid_mask]))
@@ -164,18 +234,48 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     unc_map = np.full_like(mean_flat, np.nan)
     unc_map[valid_mask] = uncertainty_years
     unc_map = unc_map.reshape(mean_grid.shape)
+
+    modeled_mean_years = mean_grid * (max_age - min_age) + min_age
+    modeled_mean_mask = np.isfinite(modeled_mean_years) & (holocene_extent < 1.0) & (~modern_ice_mask)
+    if "valid_mask" in ds:
+        modeled_mean_mask &= ds["valid_mask"].values.astype(bool)
+    modeled_mean_years = np.where(modeled_mean_mask, modeled_mean_years, np.nan)
     
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
     
-    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap='viridis_r', shading='auto')
+    n_levels = 16
+    age_bounds = np.linspace(min_age, max_age, n_levels + 1, dtype=np.float32)
+    age_cmap = plt.get_cmap("viridis_r", n_levels)
+    age_norm = mcolors.BoundaryNorm(age_bounds, age_cmap.N, clip=True)
+    
+    im1 = axes[0].pcolormesh(
+        X_grid,
+        Y_grid,
+        age_map,
+        cmap=age_cmap,
+        norm=age_norm,
+        shading="auto",
+    )
     axes[0].set_title("Reconstructed Deglaciation Age (Years)")
     axes[0].set_aspect('equal')
-    plt.colorbar(im1, ax=axes[0], label="Age (Years)")
+    plt.colorbar(im1, ax=axes[0], label="Age (Years)", boundaries=age_bounds)
     
-    im2 = axes[1].pcolormesh(X_grid, Y_grid, unc_map, cmap='plasma', shading='auto')
-    axes[1].set_title("Prediction Uncertainty (1 Std Dev, Years)")
+    im2 = axes[1].pcolormesh(
+        X_grid,
+        Y_grid,
+        modeled_mean_years,
+        cmap=age_cmap,
+        norm=age_norm,
+        shading="auto",
+    )
+    axes[1].set_title("Modeled Mean Deglaciation Age (Years)")
     axes[1].set_aspect('equal')
-    plt.colorbar(im2, ax=axes[1], label="Uncertainty (Years)")
+    plt.colorbar(im2, ax=axes[1], label="Age (Years)", boundaries=age_bounds)
+
+    im3 = axes[2].pcolormesh(X_grid, Y_grid, unc_map, cmap='plasma', shading='auto')
+    axes[2].set_title("Prediction Uncertainty (1 Std Dev, Years)")
+    axes[2].set_aspect('equal')
+    plt.colorbar(im3, ax=axes[2], label="Uncertainty (Years)")
     
     plt.tight_layout()
     plt.show()
@@ -185,12 +285,44 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a GP for deglaciation age with PCA-parameterized mean.")
     parser.add_argument("--pca_path", type=Path, default=Path("data/deglaciation_snapshot_pca.nc"), help="PCA output NetCDF")
-    parser.add_argument("--ages_path", type=Path, default=Path("data/age_data_epsg3413.csv"), help="Age observations CSV")
-    parser.add_argument("--num_pca_modes", type=int, default=10, help="Number of PCA modes to use in the mean function")
+    parser.add_argument("--ages_path", type=Path, default=Path("data/ryan_data/all_data.csv"), help="Age observations CSV")
+    parser.add_argument("--num_pca_modes", type=int, default=5, help="Number of PCA modes to use in the mean function")
+    parser.add_argument(
+        "--cosmogenic-only",
+        action="store_true",
+        help="Use only cosmogenic observations (requires obs_type column).",
+    )
+    parser.add_argument(
+        "--min-quality",
+        type=str,
+        default="Low",
+        choices=["High", "Mid", "Low"],
+        help="Include all observations at least this good (High ⊂ Mid ⊂ Low). Ignored with --cosmogenic-only.",
+    )
+    parser.add_argument(
+        "--ages-bp-ref-year",
+        type=float,
+        default=1950.0,
+        help="Reference year for CSV ages (years before this year). Default: 1950.",
+    )
+    parser.add_argument(
+        "--model-bp-ref-year",
+        type=float,
+        default=1850.0,
+        help="Reference year expected by the model (years before this year). Default: 1850.",
+    )
     args = parser.parse_args()
 
     ds, min_age, max_age = load_pca_dataset(args.pca_path)
-    x, y, ages, errs = load_age_data(args.ages_path, min_age, max_age)
+    ages_df = load_age_data(args.ages_path, min_age, max_age)
+    ages_df = filter_age_data(ages_df, cosmogenic_only=bool(args.cosmogenic_only), min_quality=str(args.min_quality))
+    x, y, ages, errs = normalize_age_data(
+        ages_df,
+        min_age,
+        max_age,
+        ages_bp_ref_year=float(args.ages_bp_ref_year),
+        model_bp_ref_year=float(args.model_bp_ref_year),
+    )
     
     print(f"\nInterpolating data using {args.num_pca_modes} PCA modes...")
     train_x, train_y, train_errs, valid_mask, coords_mean, coords_std = prepare_training_tensors(
@@ -234,7 +366,7 @@ def main() -> None:
 
     print("\nTraining complete.")
     
-    predict_and_plot_grid(model, ds, args.num_pca_modes, min_age, max_age, coords_mean, coords_std)
+    predict_and_plot_grid(model, ds, args.num_pca_modes, 6e3, max_age, coords_mean, coords_std)
 
 if __name__ == "__main__":
     main()

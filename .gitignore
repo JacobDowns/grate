@@ -32,21 +32,8 @@ dist/
 # Notebooks
 .ipynb_checkpoints/
 
-# Data artifacts (large / generated)
-data/**/*.nc
-data/**/*.h5
-data/**/*.pt
-data/**/*.pth
-data/**/*.npy
-data/**/*.npz
-data/**/*.png
-data/**/*.pdf
-data/**/*.tif
-data/**/*.tiff
-
-# Keep small/raw tabular inputs
-!data/**/*.csv
-!data/**/*.tsv
+# Data folder (ignored entirely)
+data/
 
 # ISSM outputs (very large binaries)
 issm_outputs/**/*.mat

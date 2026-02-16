@@ -230,10 +230,12 @@ def write_run_netcdf(
     out_dtype: str,
     compression_level: int,
     add_latlon: bool,
+    progress_every: int = 0,
 ) -> None:
     import numpy as np
     import h5py
     import h5netcdf
+    import time as time_mod
 
     out_nc.parent.mkdir(parents=True, exist_ok=True)
 
@@ -242,8 +244,8 @@ def write_run_netcdf(
         if "time" not in src:
             raise KeyError(f"{run_h5} missing 'time' dataset")
 
-        time = np.asarray(src["time"][:], dtype=np.float64)
-        nt = int(time.size)
+        time_vals = np.asarray(src["time"][:], dtype=np.float64)
+        nt = int(time_vals.size)
 
         # Dimensions
         dst.dimensions = {
@@ -255,7 +257,7 @@ def write_run_netcdf(
 
         # Coordinates
         vtime = dst.create_variable("time", ("time",), dtype="f8")
-        vtime[:] = time
+        vtime[:] = time_vals
         vtime.attrs["units"] = "years since 1850-01-01 00:00:00"
         vtime.attrs["long_name"] = "time (converted; may be negative for years before 1850)"
 
@@ -346,11 +348,15 @@ def write_run_netcdf(
 
             name = _sanitize_name(key)
             shape = tuple(ds.shape)
+            t_var_start = time_mod.perf_counter()
 
             # Scalars-per-time (e.g. IceVolume) -> write as (time,)
             if len(shape) == 1 and shape[0] == nt:
                 v = dst.create_variable(name, ("time",), dtype="f8")
                 v[:] = np.asarray(ds[:], dtype=np.float64)
+                if progress_every:
+                    dt = time_mod.perf_counter() - t_var_start
+                    print(f"  wrote {name} {shape} in {dt:.1f}s", flush=True)
                 continue
 
             # Nodal-per-time (already 2D) -> interpolate to grid and write as (time, y, x)
@@ -367,10 +373,20 @@ def write_run_netcdf(
                 v.attrs["grid_mapping"] = "crs"
                 v.attrs["coordinates"] = "time y x"
 
+                t_loop_start = time_mod.perf_counter()
                 for ti in range(nt):
                     vals = ds[ti, :]
                     grid2d = interp_nodal_to_grid(vals, linmap=linmap, out_dtype=out_dtype)
                     v[ti, :, :] = grid2d
+                    if progress_every and ((ti + 1) % progress_every == 0 or (ti + 1) == nt):
+                        elapsed = time_mod.perf_counter() - t_loop_start
+                        rate = (ti + 1) / elapsed if elapsed > 0 else float("inf")
+                        eta = (nt - (ti + 1)) / rate if rate > 0 else float("inf")
+                        print(
+                            f"  {name}: {ti+1}/{nt} slabs written "
+                            f"({rate:.2f} slabs/s, ETA {eta/60:.1f} min)",
+                            flush=True,
+                        )
                 continue
 
             # Layered nodal-per-time -> either collapse (if identical across layers) or write (time, layer, y, x)
@@ -394,10 +410,20 @@ def write_run_netcdf(
                     v.attrs["coordinates"] = "time y x"
                     v.attrs["note"] = "collapsed from (time,layer,vertex) because values are identical across layers"
 
+                    t_loop_start = time_mod.perf_counter()
                     for ti in range(nt):
                         vals = ds[ti, :n2d]
                         grid2d = interp_nodal_to_grid(vals, linmap=linmap, out_dtype=out_dtype)
                         v[ti, :, :] = grid2d
+                        if progress_every and ((ti + 1) % progress_every == 0 or (ti + 1) == nt):
+                            elapsed = time_mod.perf_counter() - t_loop_start
+                            rate = (ti + 1) / elapsed if elapsed > 0 else float("inf")
+                            eta = (nt - (ti + 1)) / rate if rate > 0 else float("inf")
+                            print(
+                                f"  {name}: {ti+1}/{nt} slabs written "
+                                f"({rate:.2f} slabs/s, ETA {eta/60:.1f} min)",
+                                flush=True,
+                            )
                     continue
 
                 v = dst.create_variable(
@@ -412,12 +438,22 @@ def write_run_netcdf(
                 v.attrs["grid_mapping"] = "crs"
                 v.attrs["coordinates"] = "time layer y x"
 
+                t_loop_start = time_mod.perf_counter()
                 for ti in range(nt):
                     vals_all = ds[ti, :]
                     for li in range(mesh.nlayers):
                         vals = vals_all[li * n2d : (li + 1) * n2d]
                         grid2d = interp_nodal_to_grid(vals, linmap=linmap, out_dtype=out_dtype)
                         v[ti, li, :, :] = grid2d
+                    if progress_every and ((ti + 1) % progress_every == 0 or (ti + 1) == nt):
+                        elapsed = time_mod.perf_counter() - t_loop_start
+                        rate = (ti + 1) / elapsed if elapsed > 0 else float("inf")
+                        eta = (nt - (ti + 1)) / rate if rate > 0 else float("inf")
+                        print(
+                            f"  {name}: {ti+1}/{nt} timesteps written "
+                            f"({rate:.2f} steps/s, ETA {eta/60:.1f} min)",
+                            flush=True,
+                        )
                 continue
 
             # Fallback: write raw
@@ -429,6 +465,9 @@ def write_run_netcdf(
                 dim_names.append(dim)
             v = dst.create_variable(name, tuple(dim_names), dtype="f8")
             v[:] = np.asarray(ds[:], dtype=np.float64)
+            if progress_every:
+                dt = time_mod.perf_counter() - t_var_start
+                print(f"  wrote {name} {shape} in {dt:.1f}s", flush=True)
 
 
 def main() -> None:
@@ -441,8 +480,8 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path, default=default_in, help="Directory containing run_XX_tot.h5 files")
     parser.add_argument("--pattern", type=str, default="run_*_tot.h5", help="Glob pattern for input .h5 files")
     parser.add_argument("--output-dir", type=Path, default=default_out, help="Directory to write NetCDF files")
-    parser.add_argument("--dx", type=float, default=2500.0, help="Grid spacing in x (meters) (default: 2500)")
-    parser.add_argument("--dy", type=float, default=2500.0, help="Grid spacing in y (meters) (default: 2500)")
+    parser.add_argument("--dx", type=float, default=1500.0, help="Grid spacing in x (meters) (default: 2500)")
+    parser.add_argument("--dy", type=float, default=1500.0, help="Grid spacing in y (meters) (default: 2500)")
     parser.add_argument("--margin", type=float, default=0.0, help="Extra margin around mesh bounds (meters)")
     parser.add_argument(
         "--dtype",
@@ -452,6 +491,12 @@ def main() -> None:
     )
     parser.add_argument("--compression-level", type=int, default=4, help="NetCDF deflate compression level (0-9)")
     parser.add_argument("--add-latlon", action="store_true", help="Also write 2D lat/lon grids (if EPSG is known)")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="If >0, print progress every N timesteps while writing each variable (default: 0).",
+    )
     args = parser.parse_args()
 
     import numpy as np
@@ -483,6 +528,7 @@ def main() -> None:
             out_dtype=args.dtype,
             compression_level=int(args.compression_level),
             add_latlon=bool(args.add_latlon),
+            progress_every=int(args.progress_every),
         )
 
 

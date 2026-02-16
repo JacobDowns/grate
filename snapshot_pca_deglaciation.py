@@ -110,25 +110,46 @@ def _snapshot_pca(
 
 
 def main() -> None:
-    default_input = Path("data/issm_extracted_nc")
+    default_input = Path("data/issm_deglaciation_age_nc")
     default_out = Path("data/deglaciation_snapshot_pca.nc")
 
     parser = argparse.ArgumentParser(
         description=(
             "Snapshot PCA on per-run deglaciation maps (2D). Reads 'deglaciation_age' from run_*.nc files,\n"
             "normalizes each map so oldest time -> 1 and most recent -> 0, masks out NaNs (intersection mask),\n"
-            "and writes maps + first 20 PCA modes to a single NetCDF."
+            "and writes maps + PCA modes to a single NetCDF.\n"
+            "\n"
+            "This script also supports an alternate mean definition that, for modern ice-free pixels,\n"
+            "averages only over runs where the pixel deglaciated (i.e. deglaciation_age_norm > 0),\n"
+            "ignoring runs where the pixel never deglaciated (0)."
         )
     )
     parser.add_argument("--input-dir", type=Path, default=default_input, help="Directory containing per-run NetCDF files")
-    parser.add_argument("--pattern", type=str, default="run_*_tot.nc", help="Glob pattern (default: run_*_tot.nc)")
+    parser.add_argument(
+        "--pattern", type=str, default="*_deglaciation_age.nc", help="Glob pattern (default: *_deglaciation_age.nc)"
+    )
     parser.add_argument("--var", type=str, default="deglaciation_age", help="Variable name to use (default: deglaciation_age)")
     parser.add_argument("--modes", type=int, default=20, help="Number of modes to save (default: 20)")
     parser.add_argument("--out", type=Path, default=default_out, help="Output NetCDF path")
     parser.add_argument("--compression-level", type=int, default=4, help="Gzip compression level (0-9) for output (default: 4)")
+    parser.add_argument(
+        "--qgreenland-bed",
+        type=Path,
+        default=Path("data/qgreenland/bedmachine_bed.tif"),
+        help="Bed elevation GeoTIFF (will be reprojected to the output grid).",
+    )
+    parser.add_argument(
+        "--qgreenland-thickness",
+        type=Path,
+        default=Path("data/qgreenland/bedmap_thickness.tif"),
+        help="Modern thickness GeoTIFF (will be reprojected to the output grid).",
+    )
     args = parser.parse_args()
 
     import numpy as np
+    import rasterio.enums
+    import rasterio.transform
+    import rioxarray  # noqa: F401
     import xarray as xr
 
     files = sorted(args.input_dir.glob(args.pattern))
@@ -177,33 +198,96 @@ def main() -> None:
     run_ids = np.array([r.run_id for r in runs], dtype=np.int32)
     global_max_age_years = float(np.nanmax(scales))
 
+    # Reproject qgreenland rasters (bed elevation + modern thickness) to this grid for context and masking.
+    ny, nx = runs[0].age.shape
+    dx = float(x0[1] - x0[0]) if x0.size > 1 else float("nan")
+    dy = float(y0[1] - y0[0]) if y0.size > 1 else float("nan")
+    left = float(np.nanmin(x0) - 0.5 * dx)
+    right = float(np.nanmax(x0) + 0.5 * dx)
+    bottom = float(np.nanmin(y0) - 0.5 * dy)
+    top = float(np.nanmax(y0) + 0.5 * dy)
+    transform = rasterio.transform.from_bounds(left, bottom, right, top, width=int(nx), height=int(ny))
+
+    template = xr.DataArray(
+        np.zeros((ny, nx), dtype=np.float32),
+        dims=("y", "x"),
+        coords={"y": ("y", y0), "x": ("x", x0)},
+        name="template",
+    ).rio.write_crs("EPSG:3413", inplace=False).rio.write_transform(transform, inplace=False)
+
+    def _reproject_tif(path: Path, *, name: str) -> xr.DataArray:
+        da = rioxarray.open_rasterio(path, masked=True).squeeze()
+        # rioxarray will carry CRS/transform from the GeoTIFF; reproject to our template grid.
+        out = da.rio.reproject_match(template, resampling=rasterio.enums.Resampling.bilinear)
+        out = out.rename(name).astype("float32")
+        out = out.assign_coords({"y": ("y", y0), "x": ("x", x0)})
+        return out
+
+    bed_elevation = _reproject_tif(args.qgreenland_bed, name="bed_elevation")
+    modern_thickness = _reproject_tif(args.qgreenland_thickness, name="modern_thickness")
+
     # Build PCA matrix (run, pix) using the intersection mask.
     flat_idx = np.nonzero(valid_mask.reshape(-1))[0]
     X = age_norm_stack.reshape(n_runs, -1)[:, flat_idx].astype(np.float64, copy=False)
 
-    # Mean deglaciation history (normalized 0..1) across simulations.
-    mean_hist_flat = X.mean(axis=0)
+    # Mean deglaciation history (normalized 0..1) across simulations (original approach: include 0s).
+    mean_hist_flat_all = X.mean(axis=0)
 
-    # Deviations from the mean history.
-    X_anom = X - mean_hist_flat
+    # Alternate mean for modern ice-free pixels:
+    # average only over runs where the pixel deglaciated (age_norm > 0), ignoring 0s.
+    thk_flat = modern_thickness.values.reshape(-1)[flat_idx].astype(np.float64, copy=False)
+    modern_ice_free = np.isfinite(thk_flat) & (thk_flat <= 0.0)
+    mean_hist_flat_deglac_only = mean_hist_flat_all.copy()
+    if np.any(modern_ice_free):
+        # Compute mean over only the "deglaciated" runs (age_norm > 0), without triggering warnings
+        # for all-missing columns.
+        X_ice_free = X[:, modern_ice_free]
+        deglac = X_ice_free > 0
+        counts = deglac.sum(axis=0).astype(np.float64)
+        sums = np.where(deglac, X_ice_free, 0.0).sum(axis=0).astype(np.float64)
+        m = np.zeros_like(sums, dtype=np.float64)
+        ok = counts > 0
+        m[ok] = sums[ok] / counts[ok]
+        mean_hist_flat_deglac_only[modern_ice_free] = m
 
-    mean_flat, modes_flat, scores, evr, ev = _snapshot_pca(X_anom, n_modes=int(args.modes), center=False)
-    n_modes = modes_flat.shape[0]
-    cev = np.cumsum(evr, dtype=np.float64)
+    # Deviations from each mean history.
+    X_anom_all = X - mean_hist_flat_all
+    X_anom_deglac_only = X - mean_hist_flat_deglac_only
+
+    _, modes_flat_all, scores_all, evr_all, ev_all = _snapshot_pca(X_anom_all, n_modes=int(args.modes), center=False)
+    _, modes_flat_deglac, scores_deglac, evr_deglac, ev_deglac = _snapshot_pca(
+        X_anom_deglac_only, n_modes=int(args.modes), center=False
+    )
+    n_modes = int(min(modes_flat_all.shape[0], modes_flat_deglac.shape[0]))
+    cev_all = np.cumsum(evr_all[:n_modes], dtype=np.float64)
+    cev_deglac = np.cumsum(evr_deglac[:n_modes], dtype=np.float64)
 
     # Expand back to (mode, y, x) with NaNs outside valid_mask.
-    mean_hist_map = np.full((ny * nx,), np.nan, dtype=np.float32)
-    mean_hist_map[flat_idx] = mean_hist_flat.astype(np.float32)
-    mean_hist_map = mean_hist_map.reshape(ny, nx)
+    mean_hist_map_all = np.full((ny * nx,), np.nan, dtype=np.float32)
+    mean_hist_map_all[flat_idx] = mean_hist_flat_all.astype(np.float32)
+    mean_hist_map_all = mean_hist_map_all.reshape(ny, nx)
 
-    anom_stack = age_norm_stack.copy()
-    anom_stack[:, ~valid_mask] = np.nan
-    anom_stack = anom_stack - mean_hist_map[None, :, :]
+    mean_hist_map_deglac = np.full((ny * nx,), np.nan, dtype=np.float32)
+    mean_hist_map_deglac[flat_idx] = mean_hist_flat_deglac_only.astype(np.float32)
+    mean_hist_map_deglac = mean_hist_map_deglac.reshape(ny, nx)
 
-    modes_map = np.full((n_modes, ny * nx), np.nan, dtype=np.float32)
+    anom_stack_all = age_norm_stack.copy()
+    anom_stack_all[:, ~valid_mask] = np.nan
+    anom_stack_all = anom_stack_all - mean_hist_map_all[None, :, :]
+
+    anom_stack_deglac = age_norm_stack.copy()
+    anom_stack_deglac[:, ~valid_mask] = np.nan
+    anom_stack_deglac = anom_stack_deglac - mean_hist_map_deglac[None, :, :]
+
+    modes_map_all = np.full((n_modes, ny * nx), np.nan, dtype=np.float32)
     for i in range(n_modes):
-        modes_map[i, flat_idx] = modes_flat[i, :].astype(np.float32)
-    modes_map = modes_map.reshape(n_modes, ny, nx)
+        modes_map_all[i, flat_idx] = modes_flat_all[i, :].astype(np.float32)
+    modes_map_all = modes_map_all.reshape(n_modes, ny, nx)
+
+    modes_map_deglac = np.full((n_modes, ny * nx), np.nan, dtype=np.float32)
+    for i in range(n_modes):
+        modes_map_deglac[i, flat_idx] = modes_flat_deglac[i, :].astype(np.float32)
+    modes_map_deglac = modes_map_deglac.reshape(n_modes, ny, nx)
 
     ds = xr.Dataset(
         coords={
@@ -215,27 +299,44 @@ def main() -> None:
         data_vars={
             "deglaciation_age": (("run", "y", "x"), age_stack),
             "deglaciation_age_norm": (("run", "y", "x"), age_norm_stack),
-            "deglaciation_age_mean_norm": (("y", "x"), mean_hist_map),
-            "deglaciation_age_anom_norm": (("run", "y", "x"), anom_stack),
+            "deglaciation_age_mean_norm_all": (("y", "x"), mean_hist_map_all),
+            "deglaciation_age_anom_norm_all": (("run", "y", "x"), anom_stack_all),
+            "pca_mode_norm_all": (("mode", "y", "x"), modes_map_all),
+            "pca_score_all": (("run", "mode"), scores_all[:, :n_modes].astype(np.float32)),
+            "explained_variance_all": (("mode",), ev_all[:n_modes].astype(np.float64)),
+            "explained_variance_ratio_all": (("mode",), evr_all[:n_modes].astype(np.float64)),
+            "cumulative_explained_variance_ratio_all": (("mode",), cev_all.astype(np.float64)),
+
+            "deglaciation_age_mean_norm_deglac_only": (("y", "x"), mean_hist_map_deglac),
+            "deglaciation_age_anom_norm_deglac_only": (("run", "y", "x"), anom_stack_deglac),
+            "pca_mode_norm_deglac_only": (("mode", "y", "x"), modes_map_deglac),
+            "pca_score_deglac_only": (("run", "mode"), scores_deglac[:, :n_modes].astype(np.float32)),
+            "explained_variance_deglac_only": (("mode",), ev_deglac[:n_modes].astype(np.float64)),
+            "explained_variance_ratio_deglac_only": (("mode",), evr_deglac[:n_modes].astype(np.float64)),
+            "cumulative_explained_variance_ratio_deglac_only": (("mode",), cev_deglac.astype(np.float64)),
+
             "deglaciation_age_scale": (("run",), scales),
             "deglaciation_age_min_years": (("run",), mins),
             "deglaciation_age_max_years": (("run",), scales),
-            "pca_mode_norm": (("mode", "y", "x"), modes_map),
-            "pca_score": (("run", "mode"), scores.astype(np.float32)),
-            "explained_variance": (("mode",), ev.astype(np.float64)),
-            "explained_variance_ratio": (("mode",), evr.astype(np.float64)),
-            "cumulative_explained_variance_ratio": (("mode",), cev.astype(np.float64)),
             "valid_mask": (("y", "x"), valid_mask),
+            "bed_elevation": (("y", "x"), bed_elevation.values.astype(np.float32, copy=False)),
+            "modern_thickness": (("y", "x"), modern_thickness.values.astype(np.float32, copy=False)),
         },
         attrs={
             "source_dir": str(args.input_dir),
             "source_pattern": args.pattern,
             "source_var": args.var,
             "normalization": "per-run: deglaciation_age_norm = deglaciation_age / max_finite(deglaciation_age); oldest=1, most recent=0",
-            "pca_input": "PCA is performed on deglaciation_age_anom_norm (normalized maps with mean history subtracted)",
+            "pca_input_all": "PCA is performed on deglaciation_age_anom_norm_all (norm - mean_norm_all)",
+            "pca_input_deglac_only": (
+                "PCA is performed on deglaciation_age_anom_norm_deglac_only (norm - mean_norm_deglac_only); "
+                "mean_norm_deglac_only ignores 0-values for modern ice-free pixels"
+            ),
             "nan_mask": "PCA uses intersection of finite pixels across runs",
             "age_norm_min_years": 0.0,
             "age_norm_max_years": global_max_age_years,
+            "qgreenland_bed": str(args.qgreenland_bed),
+            "qgreenland_thickness": str(args.qgreenland_thickness),
         },
     )
 
@@ -244,20 +345,41 @@ def main() -> None:
         if k in var_attrs:
             ds["deglaciation_age"].attrs[k] = var_attrs[k]
             ds["deglaciation_age_norm"].attrs[k] = var_attrs[k]
-            ds["deglaciation_age_mean_norm"].attrs[k] = var_attrs[k]
-            ds["deglaciation_age_anom_norm"].attrs[k] = var_attrs[k]
+            ds["deglaciation_age_mean_norm_all"].attrs[k] = var_attrs[k]
+            ds["deglaciation_age_anom_norm_all"].attrs[k] = var_attrs[k]
+            ds["deglaciation_age_mean_norm_deglac_only"].attrs[k] = var_attrs[k]
+            ds["deglaciation_age_anom_norm_deglac_only"].attrs[k] = var_attrs[k]
 
     ds["deglaciation_age_norm"].attrs["units"] = "1"
-    ds["deglaciation_age_mean_norm"].attrs["units"] = "1"
-    ds["deglaciation_age_mean_norm"].attrs["long_name"] = "mean deglaciation history across runs (normalized 0..1)"
-    ds["deglaciation_age_anom_norm"].attrs["units"] = "1"
-    ds["deglaciation_age_anom_norm"].attrs["long_name"] = "deglaciation anomaly = norm - mean_norm"
-    ds["pca_mode_norm"].attrs["units"] = "1"
-    ds["pca_mode_norm"].attrs["long_name"] = "snapshot PCA spatial modes of (norm - mean_norm)"
-    ds["pca_score"].attrs["long_name"] = "snapshot PCA scores per run"
-    ds["explained_variance"].attrs["long_name"] = "variance explained by each PCA component"
-    ds["explained_variance_ratio"].attrs["long_name"] = "fraction of variance explained by each PCA component"
-    ds["cumulative_explained_variance_ratio"].attrs["long_name"] = "cumulative fraction of variance explained"
+    ds["deglaciation_age_mean_norm_all"].attrs["units"] = "1"
+    ds["deglaciation_age_mean_norm_all"].attrs["long_name"] = "mean deglaciation history across runs (normalized 0..1), including 0s"
+    ds["deglaciation_age_anom_norm_all"].attrs["units"] = "1"
+    ds["deglaciation_age_anom_norm_all"].attrs["long_name"] = "deglaciation anomaly (all-mean) = norm - mean_norm_all"
+    ds["pca_mode_norm_all"].attrs["units"] = "1"
+    ds["pca_mode_norm_all"].attrs["long_name"] = "snapshot PCA spatial modes of (norm - mean_norm_all)"
+    ds["pca_score_all"].attrs["long_name"] = "snapshot PCA scores per run (all-mean)"
+    ds["explained_variance_all"].attrs["long_name"] = "variance explained by each PCA component (all-mean)"
+    ds["explained_variance_ratio_all"].attrs["long_name"] = "fraction of variance explained by each PCA component (all-mean)"
+    ds["cumulative_explained_variance_ratio_all"].attrs["long_name"] = "cumulative fraction of variance explained (all-mean)"
+
+    ds["deglaciation_age_mean_norm_deglac_only"].attrs["units"] = "1"
+    ds["deglaciation_age_mean_norm_deglac_only"].attrs["long_name"] = (
+        "mean deglaciation history across runs (normalized 0..1); for modern ice-free pixels, "
+        "ignore runs where the pixel never deglaciated (0)"
+    )
+    ds["deglaciation_age_anom_norm_deglac_only"].attrs["units"] = "1"
+    ds["deglaciation_age_anom_norm_deglac_only"].attrs["long_name"] = "deglaciation anomaly (deglac-only mean) = norm - mean_norm_deglac_only"
+    ds["pca_mode_norm_deglac_only"].attrs["units"] = "1"
+    ds["pca_mode_norm_deglac_only"].attrs["long_name"] = "snapshot PCA spatial modes of (norm - mean_norm_deglac_only)"
+    ds["pca_score_deglac_only"].attrs["long_name"] = "snapshot PCA scores per run (deglac-only mean)"
+    ds["explained_variance_deglac_only"].attrs["long_name"] = "variance explained by each PCA component (deglac-only mean)"
+    ds["explained_variance_ratio_deglac_only"].attrs["long_name"] = "fraction of variance explained by each PCA component (deglac-only mean)"
+    ds["cumulative_explained_variance_ratio_deglac_only"].attrs["long_name"] = "cumulative fraction of variance explained (deglac-only mean)"
+
+    ds["bed_elevation"].attrs["units"] = "m"
+    ds["bed_elevation"].attrs["long_name"] = "bedrock elevation (reprojected to model grid)"
+    ds["modern_thickness"].attrs["units"] = "m"
+    ds["modern_thickness"].attrs["long_name"] = "modern ice thickness (reprojected to model grid)"
 
     ds["deglaciation_age_min_years"].attrs["units"] = "years"
     ds["deglaciation_age_max_years"].attrs["units"] = "years"
@@ -276,12 +398,26 @@ def main() -> None:
         encoding = {
             "deglaciation_age": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
             "deglaciation_age_norm": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
-            "deglaciation_age_mean_norm": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
-            "deglaciation_age_anom_norm": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
+            "deglaciation_age_mean_norm_all": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
+            "deglaciation_age_anom_norm_all": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
+            "pca_mode_norm_all": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
+            "pca_score_all": {"compression": "gzip", "compression_opts": clevel},
+            "explained_variance_all": {"compression": "gzip", "compression_opts": clevel},
+            "explained_variance_ratio_all": {"compression": "gzip", "compression_opts": clevel},
+            "cumulative_explained_variance_ratio_all": {"compression": "gzip", "compression_opts": clevel},
+
+            "deglaciation_age_mean_norm_deglac_only": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
+            "deglaciation_age_anom_norm_deglac_only": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
+            "pca_mode_norm_deglac_only": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
+            "pca_score_deglac_only": {"compression": "gzip", "compression_opts": clevel},
+            "explained_variance_deglac_only": {"compression": "gzip", "compression_opts": clevel},
+            "explained_variance_ratio_deglac_only": {"compression": "gzip", "compression_opts": clevel},
+            "cumulative_explained_variance_ratio_deglac_only": {"compression": "gzip", "compression_opts": clevel},
             "deglaciation_age_min_years": {"compression": "gzip", "compression_opts": clevel},
             "deglaciation_age_max_years": {"compression": "gzip", "compression_opts": clevel},
-            "pca_mode_norm": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (1, 256, 256)},
             "valid_mask": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
+            "bed_elevation": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
+            "modern_thickness": {"compression": "gzip", "compression_opts": clevel, "chunksizes": (256, 256)},
         }
 
     ds.to_netcdf(args.out, engine="h5netcdf", encoding=encoding)

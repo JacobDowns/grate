@@ -19,7 +19,7 @@ class PhysicsInformedGP(gpytorch.models.ExactGP):
         
         # Covariance Module: Models the spatial residual using only (x, y) coordinates
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=1.5, active_dims=[0, 1])
+            gpytorch.kernels.MaternKernel(nu=0.5, active_dims=[0, 1])
         )
 
     def forward(self, x):
@@ -103,7 +103,7 @@ def normalize_age_data(
 
     return x, y, ages, errs
 
-def prepare_training_tensors(ds, x_obs, y_obs, ages_obs, errs_obs, num_pca_modes):
+def prepare_training_tensors(ds, x_obs, y_obs, ages_obs, errs_obs, num_pca_modes, *, include_bedrock: bool):
     x_xr = xr.DataArray(x_obs, dims="points")
     y_xr = xr.DataArray(y_obs, dims="points")
     
@@ -115,7 +115,18 @@ def prepare_training_tensors(ds, x_obs, y_obs, ages_obs, errs_obs, num_pca_modes
     
     sampled_modes = sampled_modes.T[:, :num_pca_modes]
     
-    valid_mask = ~np.isnan(sampled_mean) & ~np.isnan(sampled_modes).any(axis=1)
+    if include_bedrock:
+        if "bed_elevation" not in ds_sampled:
+            raise KeyError("Requested --include-bedrock but dataset has no 'bed_elevation' variable.")
+        sampled_bed = ds_sampled["bed_elevation"].values.astype(np.float32)
+        valid_mask = (
+            ~np.isnan(sampled_mean)
+            & ~np.isnan(sampled_modes).any(axis=1)
+            & np.isfinite(sampled_bed)
+        )
+    else:
+        sampled_bed = None
+        valid_mask = ~np.isnan(sampled_mean) & ~np.isnan(sampled_modes).any(axis=1)
     
     # Extract valid coordinates
     coords_raw = np.column_stack((x_obs[valid_mask], y_obs[valid_mask]))
@@ -128,19 +139,31 @@ def prepare_training_tensors(ds, x_obs, y_obs, ages_obs, errs_obs, num_pca_modes
     coords_tensor = torch.tensor(coords_scaled, dtype=torch.float32)
     pca_features = torch.tensor(sampled_modes[valid_mask], dtype=torch.float32)
     
-    train_x = torch.cat([coords_tensor, pca_features], dim=1)
+    if include_bedrock:
+        bed_raw = sampled_bed[valid_mask].astype(np.float32)
+        bed_mean = float(np.nanmean(bed_raw))
+        bed_std = float(np.nanstd(bed_raw))
+        if not (bed_std > 0):
+            bed_std = 1.0
+        bed_scaled = (bed_raw - bed_mean) / bed_std
+        bed_tensor = torch.tensor(bed_scaled[:, None], dtype=torch.float32)
+        train_x = torch.cat([coords_tensor, bed_tensor, pca_features], dim=1)
+    else:
+        bed_mean = None
+        bed_std = None
+        train_x = torch.cat([coords_tensor, pca_features], dim=1)
     train_y = torch.tensor(ages_obs[valid_mask] - sampled_mean[valid_mask], dtype=torch.float32)
     train_errs = torch.tensor(errs_obs[valid_mask], dtype=torch.float32)
     
-    return train_x, train_y, train_errs, valid_mask, coords_mean, coords_std
+    return train_x, train_y, train_errs, valid_mask, coords_mean, coords_std, bed_mean, bed_std
 
 # --- 3. Visualization Tools ---
 
-def plot_interpolation_sanity_check(train_x, train_y, ages_obs, valid_mask, coords_mean, coords_std):
+def plot_interpolation_sanity_check(train_x, train_y, ages_obs, valid_mask, coords_mean, coords_std, *, include_bedrock: bool):
     # Un-scale coordinates just for plotting
     x_coords = (train_x[:, 0].numpy() * coords_std[0]) + coords_mean[0]
     y_coords = (train_x[:, 1].numpy() * coords_std[1]) + coords_mean[1]
-    modes = train_x[:, 2:].numpy()
+    features = train_x[:, 2:].numpy()
     
     valid_ages = ages_obs[valid_mask]
     sampled_mean = valid_ages - train_y.numpy()
@@ -157,16 +180,30 @@ def plot_interpolation_sanity_check(train_x, train_y, ages_obs, valid_mask, coor
     axes[1].set_aspect('equal')
     plt.colorbar(sc1, ax=axes[1])
     
-    if modes.shape[1] > 0:
-        sc2 = axes[2].scatter(x_coords, y_coords, c=modes[:, 0], cmap='coolwarm', s=15, alpha=0.8)
-        axes[2].set_title("3. Interpolated PCA Mode 0")
+    if features.shape[1] > 0:
+        # If bedrock is included, feature 0 is bedrock; feature 1 is PCA mode 0.
+        feature_idx = 1 if include_bedrock and features.shape[1] > 1 else 0
+        sc2 = axes[2].scatter(x_coords, y_coords, c=features[:, feature_idx], cmap='coolwarm', s=15, alpha=0.8)
+        axes[2].set_title("3. Interpolated PCA Mode 0" if feature_idx != 0 or not include_bedrock else "3. Bedrock Feature")
         axes[2].set_aspect('equal')
         plt.colorbar(sc2, ax=axes[2])
         
     plt.tight_layout()
     plt.show()
 
-def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mean, coords_std):
+def predict_and_plot_grid(
+    model,
+    ds,
+    num_pca_modes,
+    min_age,
+    max_age,
+    coords_mean,
+    coords_std,
+    *,
+    include_bedrock: bool,
+    bed_mean: float | None,
+    bed_std: float | None,
+):
     model.eval()
     
     xg = ds["x"].values
@@ -176,6 +213,7 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     # Use the "all" mean/PCA variant produced by snapshot_pca_deglaciation.py.
     mean_grid = ds["deglaciation_age_mean_norm_all"].values.astype(np.float32)
     modes_grid = ds["pca_mode_norm_all"].values.astype(np.float32)
+    bed_grid = ds["bed_elevation"].values.astype(np.float32) if include_bedrock else None
 
     if "deglaciation_age_norm" not in ds:
         raise KeyError("Dataset is missing 'deglaciation_age_norm' needed to mask output to Holocene max extent.")
@@ -202,6 +240,14 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     valid_mask = ~np.isnan(mean_flat) & ~np.isnan(modes_flat).any(axis=1)
     valid_mask &= np.isfinite(extent_flat) & (extent_flat < 1.0)
     valid_mask &= ~modern_ice_flat
+
+    if include_bedrock:
+        if bed_grid is None:
+            raise KeyError("Requested --include-bedrock but dataset has no 'bed_elevation' variable.")
+        if bed_mean is None or bed_std is None:
+            raise ValueError("include_bedrock=True requires bed_mean/bed_std from training.")
+        bed_flat = bed_grid.flatten()
+        valid_mask &= np.isfinite(bed_flat)
     
     # Scale test grid coordinates using the exact same mean/std from training
     coords_raw = np.column_stack((X_flat[valid_mask], Y_flat[valid_mask]))
@@ -209,7 +255,12 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     
     coords_tensor = torch.tensor(coords_scaled, dtype=torch.float32)
     modes_tensor = torch.tensor(modes_flat[valid_mask], dtype=torch.float32)
-    test_x = torch.cat([coords_tensor, modes_tensor], dim=1)
+    if include_bedrock:
+        bed_scaled = (bed_flat[valid_mask].astype(np.float32) - float(bed_mean)) / float(bed_std)
+        bed_tensor = torch.tensor(bed_scaled[:, None], dtype=torch.float32)
+        test_x = torch.cat([coords_tensor, bed_tensor, modes_tensor], dim=1)
+    else:
+        test_x = torch.cat([coords_tensor, modes_tensor], dim=1)
     
     print(f"\nPredicting on {test_x.shape[0]} valid grid pixels in batches...")
     batch_size = 10000
@@ -248,9 +299,9 @@ def predict_and_plot_grid(model, ds, num_pca_modes, min_age, max_age, coords_mea
     
     fig, axes = plt.subplots(1, 3, figsize=(22, 7))
     
-    n_levels = 16
+    n_levels = 32
     age_bounds = np.linspace(min_age, max_age, n_levels + 1, dtype=np.float32)
-    age_cmap = plt.get_cmap("magma_r", n_levels)
+    age_cmap = plt.get_cmap("seismic_r", n_levels)
     age_norm = mcolors.BoundaryNorm(age_bounds, age_cmap.N, clip=True)
     
     im1 = axes[0].pcolormesh(
@@ -291,7 +342,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a GP for deglaciation age with PCA-parameterized mean.")
     parser.add_argument("--pca_path", type=Path, default=Path("data/deglaciation_snapshot_pca.nc"), help="PCA output NetCDF")
     parser.add_argument("--ages_path", type=Path, default=Path("data/ryan_data/all_data.csv"), help="Age observations CSV")
-    parser.add_argument("--num_pca_modes", type=int, default=15, help="Number of PCA modes to use in the mean function")
+    parser.add_argument("--num_pca_modes", type=int, default=17, help="Number of PCA modes to use in the mean function")
     parser.add_argument(
         "--cosmogenic-only",
         action="store_true",
@@ -316,6 +367,11 @@ def main() -> None:
         default=1850.0,
         help="Reference year expected by the model (years before this year). Default: 1850.",
     )
+    parser.add_argument(
+        "--include-bedrock",
+        action="store_true",
+        help="Include bedrock elevation as an additional mean-function feature (requires bed_elevation in the NetCDF).",
+    )
     args = parser.parse_args()
 
     ds, min_age, max_age = load_pca_dataset(args.pca_path)
@@ -330,18 +386,27 @@ def main() -> None:
     )
     
     print(f"\nInterpolating data using {args.num_pca_modes} PCA modes...")
-    train_x, train_y, train_errs, valid_mask, coords_mean, coords_std = prepare_training_tensors(
-        ds, x, y, ages, errs, args.num_pca_modes
+    train_x, train_y, train_errs, valid_mask, coords_mean, coords_std, bed_mean, bed_std = prepare_training_tensors(
+        ds, x, y, ages, errs, args.num_pca_modes, include_bedrock=bool(args.include_bedrock)
     )
     
-    plot_interpolation_sanity_check(train_x, train_y, ages, valid_mask, coords_mean, coords_std)
+    plot_interpolation_sanity_check(
+        train_x,
+        train_y,
+        ages,
+        valid_mask,
+        coords_mean,
+        coords_std,
+        include_bedrock=bool(args.include_bedrock),
+    )
     
     likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
         noise=train_errs**2, 
         learn_additional_noise=True 
     )
     
-    model = PhysicsInformedGP(train_x, train_y, likelihood, num_pca_modes=args.num_pca_modes)
+    mean_feature_dim = int(args.num_pca_modes) + (1 if args.include_bedrock else 0)
+    model = PhysicsInformedGP(train_x, train_y, likelihood, num_pca_modes=mean_feature_dim)
     
     # --- Explicit Initialization ---
     # In standardized coordinate space (N(0,1)), a lengthscale of 0.1 
@@ -353,7 +418,7 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=0.033)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     
-    training_iterations = 1500
+    training_iterations = 2000
     print("\nStarting GP Training...")
     
     # Temporarily suppress CG warnings if they still pop up during early optimization
@@ -371,7 +436,18 @@ def main() -> None:
 
     print("\nTraining complete.")
     
-    predict_and_plot_grid(model, ds, args.num_pca_modes, 6e3, max_age, coords_mean, coords_std)
+    predict_and_plot_grid(
+        model,
+        ds,
+        args.num_pca_modes,
+        5e3,
+        max_age,
+        coords_mean,
+        coords_std,
+        include_bedrock=bool(args.include_bedrock),
+        bed_mean=bed_mean,
+        bed_std=bed_std,
+    )
 
 if __name__ == "__main__":
     main()

@@ -19,7 +19,7 @@ class PhysicsInformedGP(gpytorch.models.ExactGP):
         
         # Covariance Module: Models the spatial residual using only (x, y) coordinates
         self.covar_module = gpytorch.kernels.ScaleKernel(
-            gpytorch.kernels.MaternKernel(nu=0.5, active_dims=[0, 1])
+            gpytorch.kernels.MaternKernel(nu=1.5, active_dims=[0, 1])
         )
 
     def forward(self, x):
@@ -342,7 +342,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train a GP for deglaciation age with PCA-parameterized mean.")
     parser.add_argument("--pca_path", type=Path, default=Path("data/deglaciation_snapshot_pca.nc"), help="PCA output NetCDF")
     parser.add_argument("--ages_path", type=Path, default=Path("data/ryan_data/all_data.csv"), help="Age observations CSV")
-    parser.add_argument("--num_pca_modes", type=int, default=17, help="Number of PCA modes to use in the mean function")
+    parser.add_argument("--num_pca_modes", type=int, default=18, help="Number of PCA modes to use in the mean function")
     parser.add_argument(
         "--cosmogenic-only",
         action="store_true",
@@ -418,7 +418,7 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=0.033)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
     
-    training_iterations = 2000
+    training_iterations = 2500
     print("\nStarting GP Training...")
     
     # Temporarily suppress CG warnings if they still pop up during early optimization
@@ -441,7 +441,7 @@ def main() -> None:
         ds,
         args.num_pca_modes,
         5e3,
-        max_age,
+        14.5e3,
         coords_mean,
         coords_std,
         include_bedrock=bool(args.include_bedrock),

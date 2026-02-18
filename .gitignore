@@ -45,3 +45,4 @@ issm_outputs/**/*.mat
 tmp/
 *.log
 
+/data

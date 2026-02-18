@@ -480,8 +480,8 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path, default=default_in, help="Directory containing run_XX_tot.h5 files")
     parser.add_argument("--pattern", type=str, default="run_*_tot.h5", help="Glob pattern for input .h5 files")
     parser.add_argument("--output-dir", type=Path, default=default_out, help="Directory to write NetCDF files")
-    parser.add_argument("--dx", type=float, default=1500.0, help="Grid spacing in x (meters) (default: 2500)")
-    parser.add_argument("--dy", type=float, default=1500.0, help="Grid spacing in y (meters) (default: 2500)")
+    parser.add_argument("--dx", type=float, default=1000.0, help="Grid spacing in x (meters) (default: 2500)")
+    parser.add_argument("--dy", type=float, default=1000.0, help="Grid spacing in y (meters) (default: 2500)")
     parser.add_argument("--margin", type=float, default=0.0, help="Extra margin around mesh bounds (meters)")
     parser.add_argument(
         "--dtype",

@@ -326,7 +326,7 @@ def predict_and_plot_grid(model, ds, mlp_features, gp_features, feature_stats, m
     # Plotting
     fig, axes = plt.subplots(1, 3, figsize=(22, 7))
     
-    n_levels = 32
+    n_levels = 64
     age_bounds = np.linspace(min_age, max_age, n_levels + 1, dtype=np.float32)
     age_cmap = plt.get_cmap("seismic_r", n_levels)
     age_norm = mcolors.BoundaryNorm(age_bounds, age_cmap.N, clip=True)
@@ -359,10 +359,10 @@ def main() -> None:
     
     # --- SPLIT FEATURE SELECTION ---
     parser.add_argument("--mlp-features", nargs="*", 
-                        default=["bed_elevation", "signed_distance_to_margin", "distance_to_coast"],
+                        default=["bed_elevation", "signed_distance_to_margin"],
                         help="Features passed to the Neural Network (mean function). Coordinates (x,y) are always included automatically.")
     parser.add_argument("--gp-features", nargs="*", 
-                        default=['bed_elevation', 'signed_distance_to_margin', 'distance_to_coast'],
+                        default=['bed_elevation', 'bed_slope'],
                         help="Features passed to the Gaussian Process (covariance function). Coordinates (x,y) are always included automatically.")
     
     parser.add_argument("--cosmogenic-only", action="store_true")

@@ -308,7 +308,7 @@ def main() -> None:
     parser.add_argument(
         "--resolution-m",
         type=float,
-        default=500.0,
+        default=1000.0,
         help=(
             "Target output grid resolution (meters). Default 500. "
             "Set to 150 to keep native resolution, or any positive value."

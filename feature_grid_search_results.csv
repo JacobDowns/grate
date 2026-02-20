@@ -1,0 +1,5 @@
+Mean_Features,GP_Features,RMSE,R2
+None,None,2071.8652,0.19624189
+None,bed_elevation,2103.3499,0.1673086
+None,signed_distance_to_margin,2031.1318,0.23858804
+None,distance_to_coast,2123.5295,0.14266744

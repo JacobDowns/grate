@@ -1,377 +1,442 @@
-#!/usr/bin/env python
-
-import numpy as np
-import pandas as pd
 import xarray as xr
+import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import scipy.ndimage as ndimage
 import torch
-
-
-# ============================
-# Helper: nearest index in 1D
-# ============================
-
-def nearest_index(values: np.ndarray, coords: np.ndarray) -> np.ndarray:
-    """Return nearest integer indices of `values` within a 1D coordinate array."""
-    return np.abs(coords[None, :] - values[:, None]).argmin(axis=1)
-
-
-# ============================
-# 1. Load PCA modes + mean SDF + grid
-# ============================
-
-modes_ds = xr.open_dataset("data/signed_distance_pca_modes.nc")
-
-# Expecting: modes(mode, y, x), mean_field(y, x), x(x), y(y)
-modes = modes_ds["modes"].values.astype(np.float32)       # (n_modes, ny, nx)
-mean_sdf = modes_ds["mean_field"].values.astype(np.float32)  # (ny, nx)
-reference_field = (
-    modes_ds["reference_field"].values.astype(np.float32)
-    if "reference_field" in modes_ds
-    else np.zeros_like(mean_sdf, dtype=np.float32)
-)  # baseline added back to anomalies
-x = modes_ds["x"].values.astype(np.float32)               # (nx,)
-y = modes_ds["y"].values.astype(np.float32)               # (ny,)
-
-ny, nx = mean_sdf.shape
-n_modes_total = modes.shape[0]
-
-# Choose a subset of leading modes to use
-n_modes_use = 20
-modes = modes[:n_modes_use]  # (M, ny, nx)
-M = n_modes_use
-
-print(f"Using {M} PCA modes out of {n_modes_total}.")
-
-alpha  = 100.0 
-
-# ============================
-# 2. Load age data (years BP -> ka)
-# ============================
-
-ages_df = pd.read_csv("data/age_data_epsg3413.csv")
-
-age_xs = ages_df["x_3413"].to_numpy(dtype=np.float32)
-age_ys = ages_df["y_3413"].to_numpy(dtype=np.float32)
-
-# Observed ages & 1-sigma errors are in years BP -> convert to ka
-age_obs_years = ages_df["ages"].to_numpy(dtype=np.float32)
-age_err_years = ages_df["errors"].to_numpy(dtype=np.float32) 
-
-age_obs = age_obs_years / 1000.0  # (J,) in ka
-age_err = age_err_years / 1000.0  # (J,) in ka
-#age_err /= 100.0
-
-J = age_obs.shape[0]
-print(f"Loaded {J} age observations (converted to ka).")
-
-# Map age sites onto grid
-ages_df["x_index"] = nearest_index(age_xs, x)
-ages_df["y_index"] = nearest_index(age_ys, y)
-
-ix = ages_df["x_index"].to_numpy()
-iy = ages_df["y_index"].to_numpy()
-
-
-# ============================
-# 3. Build reconstruction time grid (in ka)
-# ============================
-
-# Make a time grid that covers the age range with some buffer (in ka)
-age_min = float(age_obs.min())
-age_max = float(age_obs.max())
-buffer = 0.5  # ka
-dt = 0.25     # ka step
-
-t_start = age_min - buffer
-t_end = age_max + buffer
-
-time_grid = np.arange(t_start, t_end + 1e-6, dt, dtype=np.float32)  # (T,)
-T = time_grid.shape[0]
-
-print(f"Time grid: {T} points from {t_start:.2f} to {t_end:.2f} ka, step {dt} ka.")
-
-
-# ============================
-# 4. Precompute SDF basis values at age sites
-# ============================
-
-# Mean SDF at age sites
-mean_sdf_sites = mean_sdf[iy, ix].astype(np.float32)  # (J,)
-
-# Mode values at age sites: (J, M)
-mode_vals_sites = np.zeros((J, M), dtype=np.float32)
-for m in range(M):
-    mode_vals_sites[:, m] = modes[m, iy, ix]
-
-print("Precomputed SDF basis at age sites.")
-
-
-# ============================
-# 5. Move data to torch (float32)
-# ============================
-
-device = torch.device("cpu")  # or torch.device("cuda") if available
-
-time_grid_t = torch.from_numpy(time_grid).to(device=device, dtype=torch.float32)          # (T,)
-mean_sdf_sites_t = torch.from_numpy(mean_sdf_sites).to(device=device, dtype=torch.float32)  # (J,)
-mode_vals_sites_t = torch.from_numpy(mode_vals_sites).to(device=device, dtype=torch.float32) # (J, M)
-age_obs_t = torch.from_numpy(age_obs).to(device=device, dtype=torch.float32)              # (J,)
-age_err_t = torch.from_numpy(age_err).to(device=device, dtype=torch.float32)              # (J,)
-
-
-# ============================
-# 6. Build soft labels y_star_t (J,T) from ages + uncertainties
-# ============================
-
-# We interpret ages as deglaciation times: before age -> likely ice-covered (0),
-# after age -> likely ice-free (1). Use a Gaussian CDF in time to soften with age_err.
-
-normal = torch.distributions.Normal(loc=torch.tensor(0.0, dtype=torch.float32, device=device),
-                                    scale=torch.tensor(1.0, dtype=torch.float32, device=device))
-
-t = time_grid_t[None, :]        # (1,T)
-a = age_obs_t[:, None]          # (J,1)
-s = age_err_t[:, None]  / 10.        # (J,1)
-s = torch.clamp(s, min=1e-3)    # avoid zero std
-
-z = (t - a) / s                 # (J,T)
-y_star_t = normal.cdf(z)        # (J,T), soft target prob of being ice-free
-
-print("Constructed soft labels y_star_t for Bernoulli likelihood.")
-
-
-# ============================
-# 7. GP prior on coefficients in time (float32)
-# ============================
-
-def rbf_kernel(t, length_scale, variance):
-    """
-    Squared-exponential (RBF) kernel in float32.
-
-    t: (T,) 1D tensor of times (ka), dtype float32
-    length_scale: float
-    variance: float
-    returns: (T, T) covariance matrix (float32)
-    """
-    dt = t[:, None] - t[None, :]
-    return variance * torch.exp(-0.5 * (dt / length_scale)**2)
-
-
-# Hyperparameters for GP prior (tune these)
-length_scale = 0.05   # ka, correlation length
-coeff_std   = 100.0   # prior std dev for coefficients (SDF units)
-variance    = coeff_std**2
-
-base_nugget = 1e-5
-max_tries   = 7
-
-# Build base covariance (without nugget)
-K = rbf_kernel(time_grid_t, length_scale, variance)
-
-# Force exact symmetry
-K = 0.5 * (K + K.T)
-
-# Try Cholesky with increasing jitter
-L = None
-logdet_K = None
-nugget = base_nugget
-
-for attempt in range(max_tries):
-    try:
-        K_jittered = K + nugget * torch.eye(T, device=device, dtype=torch.float32)
-        L = torch.linalg.cholesky(K_jittered)
-        logdet_K = 2.0 * torch.sum(torch.log(torch.diag(L)))
-        print(f"Cholesky succeeded with nugget={nugget:.1e}")
-        break
-    except torch._C._LinAlgError:
-        print(f"Cholesky failed with nugget={nugget:.1e}, increasing jitter...")
-        nugget *= 10.0
-
-if L is None:
-    raise RuntimeError("Cholesky failed even with large jitter; check time grid / kernel settings.")
-
-
-def gp_log_prior(coeffs, L, logdet_K):
-    """
-    GP log prior for coefficients.
-
-    coeffs: (M, T), dtype float32
-    L: (T, T) Cholesky factor of K_jittered
-    logdet_K: scalar log |K_jittered|
-
-    Returns scalar log p(c) assuming independent modes, each ~ N(0, K).
-    """
-    M, T = coeffs.shape
-    logp = torch.tensor(0.0, dtype=torch.float32, device=coeffs.device)
-
-    for m in range(M):
-        c_m = coeffs[m]  # (T,)
-        # Solve K x = c using cholesky_solve with A = K = L L^T
-        x = torch.cholesky_solve(c_m.unsqueeze(1), L)  # (T,1)
-        x = x.squeeze(1)  # (T,)
-
-        quad = torch.dot(c_m, x)
-        logp += -0.5 * (quad + logdet_K + T * np.log(2.0 * np.pi))
-
-    return logp
-
-
-# ============================
-# 8. Forward model: coeffs -> P(ice-free) in time
-# ============================
-
-def predict_ice_free_prob(coeffs, alpha=1.0):
-    """
-    coeffs: (M, T)
-
-    Returns:
-        p: (J, T), probability of being ice-free at each site & time.
-
-    Uses logistic(SDF) with SDF < 0 => ice-covered, SDF > 0 => ice-free.
-    """
-    # SDF at sites & times: d_{j,k} = mean_j + sum_m c[m,k] * phi_{m,j}
-    # mode_vals_sites_t: (J, M), coeffs: (M, T) -> (J, T)
-    sdf = mean_sdf_sites_t[:, None] + mode_vals_sites_t @ coeffs  # (J,T)
-
-    # logistic on SDF: P(ice-free)
-    p = torch.sigmoid(alpha * sdf)
-    return p
-
-
-# ============================
-# 9. Likelihood: time-series Bernoulli with soft labels
-# ============================
-
-def log_likelihood(coeffs, alpha=10.0):
-    """
-    coeffs: (M, T)
-
-    Uses Bernoulli log-likelihood over time with soft labels y_star_t (J,T),
-    where y_star_t(j,k) is the target probability that site j is ice-free at time t_k.
-    """
-    p = predict_ice_free_prob(coeffs, alpha=alpha)  # (J,T)
-    eps = 1e-8
-    #l = torch.log((p - y_star_t)**2)
-
-    #print(p - y_star_t)
-
-    #l = l.sum()
-
-    ll = (y_star_t * torch.log(p + eps) + (1.0 - y_star_t) * torch.log(1.0 - p + eps)).sum()
-    #print(ll[0])
-    return ll
-
-
-def log_posterior(coeffs, alpha=10.0):
-    """
-    coeffs: (M, T)
-    """
-    return log_likelihood(coeffs, alpha=alpha) + gp_log_prior(coeffs, L, logdet_K)
-
-
-# ============================
-# 10. MAP optimization
-# ============================
-
-# Initialize coefficients to zero (or small noise)
-coeffs = torch.nn.Parameter(torch.zeros(M, T, device=device, dtype=torch.float32))
-
-optimizer = torch.optim.Adam([coeffs], lr=1e-2)
-
-n_iters = 50000
-print_every = 500
-
-print("Starting MAP optimization...")
-for it in range(n_iters):
-    optimizer.zero_grad()
-    neg_log_post = -log_posterior(coeffs, alpha=10.0)
-    neg_log_post.backward()
-    optimizer.step()
-
-    if it % print_every == 0 or it == n_iters - 1:
-        print(f"iter {it:4d}, -logpost = {neg_log_post.item():.3f}")
-
-coeffs_map = coeffs.detach().cpu().numpy().astype(np.float32)  # (M, T)
-print("Optimization done.")
-
-
-# ============================
-# 11. Diagnostics
-# ============================
-
-# A. Plot some coefficient trajectories (MAP) vs time
-modes_to_plot = min(3, M)
-
-fig, axes = plt.subplots(modes_to_plot, 1, figsize=(10, 3.5 * modes_to_plot), sharex=True)
-if modes_to_plot == 1:
-    axes = [axes]
-
-for mi in range(modes_to_plot):
-    ax = axes[mi]
-    ax.plot(time_grid, coeffs_map[mi], color="red", lw=2, label="MAP")
-    ax.axhline(0.0, color="k", lw=1, alpha=0.5)
-    ax.set_ylabel(f"Coeff mode {mi}")
-    ax.legend(loc="upper right")
-
-axes[-1].set_xlabel("Time (ka)")
-fig.suptitle("MAP coefficient trajectories (SDF PCA modes)")
-plt.tight_layout()
-plt.show()
-
-
-# B. For a couple of sites, plot target vs model P(ice-free) over time
-coeffs_map_t = torch.from_numpy(coeffs_map).to(device=device, dtype=torch.float32)
-p_map = predict_ice_free_prob(coeffs_map_t, alpha=alpha)  # (J,T)
-p_map_np = p_map.detach().cpu().numpy()
-y_star_np = y_star_t.detach().cpu().numpy()
-
-n_sites_plot = min(3, J)
-site_indices = np.linspace(0, J - 1, n_sites_plot, dtype=int)
-
-fig, axes = plt.subplots(n_sites_plot, 1, figsize=(10, 3.5 * n_sites_plot), sharex=True)
-if n_sites_plot == 1:
-    axes = [axes]
-
-for idx, ax in zip(site_indices, axes):
-    ax.plot(time_grid, y_star_np[idx], "k--", lw=2, label="Target P(ice-free)")
-    ax.plot(time_grid, p_map_np[idx], "r-", lw=2, label="Model P(ice-free)")
-    ax.set_ylabel(f"Site {idx}")
-    ax.legend(loc="lower right")
-
-axes[-1].set_xlabel("Time (ka)")
-fig.suptitle("Target vs model P(ice-free) over time at selected sites")
-plt.tight_layout()
-plt.show()
-
-
-# C. Example reconstructed SDF field at some time (e.g. median age)
-median_age = float(np.median(age_obs))
-time_idx = int(np.argmin(np.abs(time_grid - median_age)))
-time_val = time_grid[time_idx]
-
-print(f"Plotting reconstructed SDF at t = {time_val:.2f} ka (time index {time_idx}).")
-
-sdf_grid = mean_sdf.copy()
-for m in range(M):
-    sdf_grid += coeffs_map[m, time_idx] * modes[m]
-
-sdf_grid += reference_field  # add baseline back in case PCA was pre-centered
-
-fig, ax = plt.subplots(figsize=(8, 6))
-im = ax.imshow(
-    sdf_grid,
-    origin="lower",
-    extent=(x.min(), x.max(), y.min(), y.max()),
-    cmap="RdBu_r"
-)
-# Overlay 0-contour (ice margin)
-X, Y = np.meshgrid(x, y)
-ax.contour(X, Y, sdf_grid, levels=[0.0], colors="k", linewidths=1.0)
-ax.set_title(f"Reconstructed SDF at t = {time_val:.2f} ka")
-ax.set_xlabel("x (EPSG:3413)")
-ax.set_ylabel("y (EPSG:3413)")
-cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-cb.set_label("Signed distance (SDF units)")
-plt.tight_layout()
-plt.show()
+import torch.nn as nn
+import gpytorch
+from pathlib import Path
+import argparse
+import pandas as pd
+
+# --- 1. Neural Network & GP Model Definition ---
+
+class MLPMean(nn.Module):
+    def __init__(self, input_dim):
+        super(MLPMean, self).__init__()
+        # Small network to prevent overfitting on sparse data
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 1),
+            nn.ReLU(),
+            nn.Linear(1, 1)
+        )
+
+    def forward(self, x):
+        return self.mlp(x).squeeze(-1)
+
+class DataDrivenGP(gpytorch.models.ExactGP):
+    # GPyTorch can natively handle multiple input tensors by passing them as a tuple
+    def __init__(self, train_x_mlp, train_x_gp, train_y, likelihood):
+        super(DataDrivenGP, self).__init__((train_x_mlp, train_x_gp), train_y, likelihood)
+        
+        #self.mean_module = MLPMean(input_dim=train_x_mlp.shape[1])
+        self.mean_module = gpytorch.means.LinearMean(input_size=train_x_mlp.shape[1], bias=True)
+
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(
+                nu=2.5, 
+                ard_num_dims=train_x_gp.shape[1] 
+            )
+        )
+
+    def forward(self, x_mlp, x_gp):
+        # The Mean only sees the MLP features
+        mean_pred = self.mean_module(x_mlp)
+        
+        # The Kernel only sees the GP features
+        covar_pred = self.covar_module(x_gp)
+        
+        return gpytorch.distributions.MultivariateNormal(mean_pred, covar_pred)
+
+# --- 2. Data Loading & Feature Engineering ---
+
+def filter_age_data(df: pd.DataFrame, cosmogenic_only: bool, min_quality: str) -> pd.DataFrame:
+    out = df.copy()
+    if cosmogenic_only:
+        out = out[out["obs_type"].astype(str).str.lower() == "cosmogenic"].copy()
+        
+    if "quality" not in out.columns:
+        return out
+
+    quality_rank = {"high": 0, "mid": 1, "low": 2}
+    q = str(min_quality).strip().lower()
+    if q in quality_rank:
+        out["_quality_rank"] = out["quality"].astype(str).str.strip().str.lower().map(quality_rank)
+        out = out[out["_quality_rank"].notna() & (out["_quality_rank"] <= quality_rank[q])].copy()
+        out = out.drop(columns=["_quality_rank"])
+    return out
+
+def compute_dynamic_features(ds: xr.Dataset, requested_features: list):
+    bed = np.nan_to_num(ds["bed_elevation"].values, nan=0.0)
+
+    if "bed_slope" in requested_features and "bed_slope" not in ds:
+        print("  -> Computing dynamic feature: bed_slope")
+        slope = ndimage.gaussian_gradient_magnitude(bed, sigma=1.0)
+        ds["bed_slope"] = (("y", "x"), slope.astype(np.float32))
+
+    if "bed_roughness" in requested_features and "bed_roughness" not in ds:
+        print("  -> Computing dynamic feature: bed_roughness")
+        c1 = ndimage.uniform_filter(bed, size=3)
+        c2 = ndimage.uniform_filter(bed * bed, size=3)
+        roughness = np.sqrt(np.clip(c2 - c1 * c1, 0, None))
+        ds["bed_roughness"] = (("y", "x"), roughness.astype(np.float32))
+
+    return ds
+
+def prepare_training_tensors(
+    ds: xr.Dataset, df: pd.DataFrame, mlp_features: list, gp_features: list,
+    min_age: float, max_age: float, ages_bp_ref_year: float, model_bp_ref_year: float
+):
+    x_obs = df["x_3413"].to_numpy(dtype=np.float32)
+    y_obs = df["y_3413"].to_numpy(dtype=np.float32)
+    ages_raw = df["age_mean"].to_numpy(dtype=np.float32)
+    errs_raw = df["age_sd"].to_numpy(dtype=np.float32)
+
+    ages_shifted = ages_raw - np.float32(float(ages_bp_ref_year) - float(model_bp_ref_year))
+    ages_norm = (ages_shifted - min_age) / (max_age - min_age)
+    ages_norm = np.clip(ages_norm, 0, 1)
+    errs_norm = errs_raw / (max_age - min_age)
+
+    x_xr = xr.DataArray(x_obs, dims="points")
+    y_xr = xr.DataArray(y_obs, dims="points")
+    ds_sampled = ds.interp(x=x_xr, y=y_xr, method="linear")
+    
+    valid_mask = np.isfinite(ages_norm)
+    all_features = list(set(mlp_features + gp_features))
+    
+    coords_raw = np.column_stack((x_obs, y_obs))
+    feature_stats = {}
+    extracted_features = {}
+    
+    for feat in all_features:
+        if feat not in ds_sampled:
+            raise KeyError(f"Feature '{feat}' not found in the dataset.")
+        feat_data = ds_sampled[feat].values.astype(np.float32)
+        valid_mask &= np.isfinite(feat_data)
+        extracted_features[feat] = feat_data
+        
+    coords_valid = coords_raw[valid_mask]
+    ages_valid = ages_norm[valid_mask]
+    errs_valid = errs_norm[valid_mask]
+    
+    coords_mean = coords_valid.mean(axis=0)
+    coords_std = coords_valid.std(axis=0)
+    coords_scaled = (coords_valid - coords_mean) / coords_std
+    feature_stats['coords'] = {'mean': coords_mean, 'std': coords_std}
+
+    # Standardize all requested custom features
+    scaled_features = {}
+    for feat in all_features:
+        feat_valid = extracted_features[feat][valid_mask]
+        feat_mean = float(np.nanmean(feat_valid))
+        feat_std = float(np.nanstd(feat_valid))
+        if feat_std == 0: feat_std = 1.0
+        
+        scaled_features[feat] = (feat_valid - feat_mean) / feat_std
+        feature_stats[feat] = {'mean': feat_mean, 'std': feat_std}
+
+    # Build MLP Tensor (Coords + Requested MLP Features)
+    mlp_tensor_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
+    for feat in mlp_features:
+        mlp_tensor_list.append(torch.tensor(scaled_features[feat][:, None], dtype=torch.float32))
+    train_x_mlp = torch.cat(mlp_tensor_list, dim=1)
+    
+    # Build GP Tensor (Coords + Requested GP Features)
+    gp_tensor_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
+    for feat in gp_features:
+        gp_tensor_list.append(torch.tensor(scaled_features[feat][:, None], dtype=torch.float32))
+    train_x_gp = torch.cat(gp_tensor_list, dim=1)
+
+    train_y = torch.tensor(ages_valid, dtype=torch.float32)
+    train_errs = torch.tensor(errs_valid, dtype=torch.float32)
+    
+    return train_x_mlp, train_x_gp, train_y, train_errs, valid_mask, feature_stats
+
+# --- 3. Visualization & Validation ---
+
+def get_metrics(y_true, y_pred):
+    mse = np.mean((y_true - y_pred)**2)
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    cod = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+    
+    if len(y_true) > 1 and np.std(y_true) > 0 and np.std(y_pred) > 0:
+        pearson_r2 = np.corrcoef(y_true, y_pred)[0, 1]**2
+    else:
+        pearson_r2 = 0.0
+        
+    return mse, cod, pearson_r2
+
+def run_checkerboard_cv(train_x_mlp, train_x_gp, train_y, train_errs, feature_stats, min_age, max_age, size, iterations):
+    coords_mean = feature_stats['coords']['mean']
+    coords_std = feature_stats['coords']['std']
+    x_coords = (train_x_mlp[:, 0].numpy() * coords_std[0]) + coords_mean[0]
+    y_coords = (train_x_mlp[:, 1].numpy() * coords_std[1]) + coords_mean[1]
+
+    ix = np.floor(x_coords / size).astype(int)
+    iy = np.floor(y_coords / size).astype(int)
+    is_even = ((ix + iy) % 2) == 0
+    mask_A, mask_B = is_even, ~is_even
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    for idx, (tr_mask, te_mask, name) in enumerate([
+        (mask_A, mask_B, "Fold 1: Train A / Test B"), 
+        (mask_B, mask_A, "Fold 2: Train B / Test A")
+    ]):
+        if np.sum(tr_mask) == 0 or np.sum(te_mask) == 0: continue
+            
+        print(f"--- Running CV: {name} (Train: {np.sum(tr_mask)}, Test: {np.sum(te_mask)}) ---")
+        
+        tx_mlp, tx_gp = train_x_mlp[tr_mask], train_x_gp[tr_mask]
+        ty, te = train_y[tr_mask], train_errs[tr_mask]
+        
+        likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=te**2, learn_additional_noise=True)
+        model = DataDrivenGP(tx_mlp, tx_gp, ty, likelihood)
+        model.covar_module.base_kernel.lengthscale = torch.tensor([[0.5] * tx_gp.shape[1]])
+        
+        model.train()
+        likelihood.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+        
+        with gpytorch.settings.max_cg_iterations(2000), gpytorch.settings.cholesky_jitter(1e-4):
+            for i in range(iterations):
+                optimizer.zero_grad()
+                output = model(tx_mlp, tx_gp)
+                loss = -mll(output, ty)
+                loss.backward()
+                optimizer.step()
+                
+        model.eval()
+        test_x_mlp, test_x_gp = train_x_mlp[te_mask], train_x_gp[te_mask]
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            pred_age_norm = model(test_x_mlp, test_x_gp).mean.numpy()
+            
+        pred_age_yrs = pred_age_norm * (max_age - min_age) + min_age
+        true_age_yrs = train_y[te_mask].numpy() * (max_age - min_age) + min_age
+        
+        mse, cod, pearson_r2 = get_metrics(true_age_yrs, pred_age_yrs)
+        print(f"  Result -> RMSE: {np.sqrt(mse):.0f} yrs | R^2: {cod:.3f}")
+        
+        ax_scatter = axes[0, idx]
+        ax_scatter.scatter(true_age_yrs, pred_age_yrs, alpha=0.7, edgecolors='k')
+        ax_scatter.plot([min_age, max_age], [min_age, max_age], 'r--', lw=2)
+        ax_scatter.set_title(f"{name}\nCoef. of Determination ($R^2$): {cod:.3f}\nRMSE: {np.sqrt(mse):.0f} yrs")
+        ax_scatter.set_xlabel("Observed Age (Years)")
+        ax_scatter.set_ylabel("Predicted Age (Years)")
+        
+        residuals = pred_age_yrs - true_age_yrs
+        ax_map = axes[1, idx]
+        sc = ax_map.scatter(x_coords[te_mask], y_coords[te_mask], c=residuals, cmap='RdBu', vmin=-2500, vmax=2500, alpha=0.8, edgecolors='k')
+        ax_map.set_title("Residuals Map (Predicted - Observed)")
+        ax_map.set_aspect('equal')
+        plt.colorbar(sc, ax=ax_map, label="Residual (Years)")
+
+    plt.tight_layout()
+    plt.show()
+
+def predict_and_plot_grid(model, ds, mlp_features, gp_features, feature_stats, min_age, max_age):
+    model.eval()
+    
+    xg = ds["x"].values
+    yg = ds["y"].values
+    X_grid, Y_grid = np.meshgrid(xg, yg)
+    
+    X_flat = X_grid.flatten()
+    Y_flat = Y_grid.flatten()
+
+    # 1. Base Validity Mask (Exclude NaNs)
+    valid_mask = np.ones_like(X_flat, dtype=bool)
+    all_features = list(set(mlp_features + gp_features))
+    
+    flat_features = {}
+    for feat in all_features:
+        feat_flat = ds[feat].values.flatten()
+        valid_mask &= np.isfinite(feat_flat)
+        flat_features[feat] = feat_flat
+
+    # 2. Ice Masking
+    if "thickness" in ds:
+        ice_mask = ds["thickness"].values.flatten() > 0.0
+    elif "ice_mask" in ds:
+        ice_mask = ds["ice_mask"].values.flatten() == 1
+    else:
+        ice_mask = np.zeros_like(X_flat, dtype=bool)
+    valid_mask &= ~ice_mask
+        
+    coords_raw = np.column_stack((X_flat[valid_mask], Y_flat[valid_mask]))
+    coords_mean, coords_std = feature_stats['coords']['mean'], feature_stats['coords']['std']
+    coords_scaled = (coords_raw - coords_mean) / coords_std
+    
+    # Build MLP Test Tensor
+    mlp_tensor_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
+    for feat in mlp_features:
+        feat_raw = flat_features[feat][valid_mask].astype(np.float32)
+        f_mean, f_std = feature_stats[feat]['mean'], feature_stats[feat]['std']
+        feat_scaled = (feat_raw - f_mean) / f_std
+        mlp_tensor_list.append(torch.tensor(feat_scaled[:, None], dtype=torch.float32))
+    test_x_mlp = torch.cat(mlp_tensor_list, dim=1)
+    
+    # Build GP Test Tensor
+    gp_tensor_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
+    for feat in gp_features:
+        feat_raw = flat_features[feat][valid_mask].astype(np.float32)
+        f_mean, f_std = feature_stats[feat]['mean'], feature_stats[feat]['std']
+        feat_scaled = (feat_raw - f_mean) / f_std
+        gp_tensor_list.append(torch.tensor(feat_scaled[:, None], dtype=torch.float32))
+    test_x_gp = torch.cat(gp_tensor_list, dim=1)
+    
+    print(f"\nPredicting on {test_x_mlp.shape[0]} valid grid pixels in batches...")
+    batch_size = 20000
+    pred_means = []
+    pred_vars = []
+    
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        for i in range(0, test_x_mlp.shape[0], batch_size):
+            b_mlp = test_x_mlp[i : i + batch_size]
+            b_gp = test_x_gp[i : i + batch_size]
+            output = model(b_mlp, b_gp)
+            pred_means.append(output.mean.numpy())
+            pred_vars.append(output.variance.numpy())
+            
+    pred_mean_flat = np.concatenate(pred_means)
+    pred_var_flat = np.concatenate(pred_vars)
+    
+    final_age_years = pred_mean_flat * (max_age - min_age) + min_age
+    uncertainty_years = np.sqrt(pred_var_flat) * (max_age - min_age)
+    
+    age_map = np.full_like(X_flat, np.nan, dtype=np.float32)
+    age_map[valid_mask] = final_age_years
+    age_map = age_map.reshape(X_grid.shape)
+    
+    unc_map = np.full_like(X_flat, np.nan, dtype=np.float32)
+    unc_map[valid_mask] = uncertainty_years
+    unc_map = unc_map.reshape(X_grid.shape)
+    
+    # Prediction from the MLP Alone
+    with torch.no_grad():
+        mlp_only_flat = model.mean_module(test_x_mlp).numpy()
+    mlp_only_years = mlp_only_flat * (max_age - min_age) + min_age
+    mlp_map = np.full_like(X_flat, np.nan, dtype=np.float32)
+    mlp_map[valid_mask] = mlp_only_years
+    mlp_map = mlp_map.reshape(X_grid.shape)
+
+    # Plotting
+    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
+    
+    n_levels = 32
+    age_bounds = np.linspace(min_age, max_age, n_levels + 1, dtype=np.float32)
+    age_cmap = plt.get_cmap("seismic_r", n_levels)
+    age_norm = mcolors.BoundaryNorm(age_bounds, age_cmap.N, clip=True)
+    
+    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap=age_cmap, norm=age_norm, shading="auto")
+    axes[0].set_title("Full Model Prediction (MLP + GP)")
+    axes[0].set_aspect('equal')
+    plt.colorbar(im1, ax=axes[0], label="Age (Years)", boundaries=age_bounds)
+    
+    im2 = axes[1].pcolormesh(X_grid, Y_grid, mlp_map, cmap=age_cmap, norm=age_norm, shading="auto")
+    axes[1].set_title("Neural Network Output (Global Trend Only)")
+    axes[1].set_aspect('equal')
+    plt.colorbar(im2, ax=axes[1], label="Age (Years)", boundaries=age_bounds)
+
+    im3 = axes[2].pcolormesh(X_grid, Y_grid, unc_map, cmap='plasma', shading='auto')
+    axes[2].set_title("Prediction Uncertainty (1 Std Dev, Years)")
+    axes[2].set_aspect('equal')
+    plt.colorbar(im3, ax=axes[2], label="Uncertainty (Years)")
+    
+    plt.tight_layout()
+    plt.show()
+
+# --- 4. Main Execution ---
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a Data-Driven MLP+GP for deglaciation age.")
+    
+    parser.add_argument("--nc_path", type=Path, default=Path("data/modern_fields_native.nc"))
+    parser.add_argument("--ages_path", type=Path, default=Path("data/age_data/combined_ages.csv"))
+    
+    # --- SPLIT FEATURE SELECTION ---
+    parser.add_argument("--mlp-features", nargs="*", 
+                        default=["bed_elevation", "signed_distance_to_margin", "distance_to_coast"],
+                        help="Features passed to the Neural Network (mean function). Coordinates (x,y) are always included automatically.")
+    parser.add_argument("--gp-features", nargs="*", 
+                        default=['bed_elevation', 'signed_distance_to_margin', 'distance_to_coast'],
+                        help="Features passed to the Gaussian Process (covariance function). Coordinates (x,y) are always included automatically.")
+    
+    parser.add_argument("--cosmogenic-only", action="store_true")
+    parser.add_argument("--min-quality", type=str, default="Low", choices=["High", "Mid", "Low"])
+    parser.add_argument("--min-age", type=float, default=0.0)
+    parser.add_argument("--max-age", type=float, default=14000.0)
+    parser.add_argument("--ages-bp-ref-year", type=float, default=1950.0)
+    parser.add_argument("--model-bp-ref-year", type=float, default=1850.0)
+    
+    parser.add_argument("--checkerboard-cv", action="store_true")
+    parser.add_argument("--checkerboard-size", type=float, default=50000.0)
+    parser.add_argument("--epochs", type=int, default=4000)
+
+    args = parser.parse_args()
+
+    # Ensure empty lists instead of None if no arguments are passed
+    mlp_feats = args.mlp_features if args.mlp_features else []
+    gp_feats = args.gp_features if args.gp_features else []
+
+    print(f"Loading Raster Features: {args.nc_path}")
+    ds = xr.open_dataset(args.nc_path, decode_times=False)
+    
+    all_requested = list(set(mlp_feats + gp_feats))
+    ds = compute_dynamic_features(ds, all_requested)
+    
+    print(f"Loading Observations: {args.ages_path}")
+    df = pd.read_csv(args.ages_path)
+    df = filter_age_data(df, cosmogenic_only=bool(args.cosmogenic_only), min_quality=str(args.min_quality))
+    
+    print(f"\nInterpolating and standardizing features...")
+    print(f"  MLP Features: ['x', 'y'] + {mlp_feats}")
+    print(f"  GP Features:  ['x', 'y'] + {gp_feats}")
+    
+    train_x_mlp, train_x_gp, train_y, train_errs, valid_mask, feature_stats = prepare_training_tensors(
+        ds, df, mlp_feats, gp_feats, args.min_age, args.max_age, 
+        args.ages_bp_ref_year, args.model_bp_ref_year
+    )
+    
+    print(f"Total valid training points: {len(train_y)}")
+    
+    if args.checkerboard_cv:
+        print(f"\n--- Running Spatial Checkerboard CV (Size: {args.checkerboard_size/1000:.0f} km) ---")
+        run_checkerboard_cv(
+            train_x_mlp, train_x_gp, train_y, train_errs, feature_stats, 
+            args.min_age, args.max_age, args.checkerboard_size, iterations=4000
+        )
+        print("--- CV Complete. Proceeding to train on FULL dataset. ---\n")
+
+    likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=train_errs**2, learn_additional_noise=True)
+    model = DataDrivenGP(train_x_mlp, train_x_gp, train_y, likelihood)
+    
+    model.covar_module.base_kernel.lengthscale = torch.tensor([[0.5] * train_x_gp.shape[1]])
+    
+    model.train()
+    likelihood.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    
+    print("Starting Final GP + MLP Training...")
+    with gpytorch.settings.max_cg_iterations(2000), gpytorch.settings.cholesky_jitter(1e-4):
+        for i in range(args.epochs):
+            optimizer.zero_grad()
+            output = model(train_x_mlp, train_x_gp)
+            loss = -mll(output, train_y)
+            loss.backward()
+            optimizer.step()
+            
+            if (i + 1) % 100 == 0:
+                lengthscale = model.covar_module.base_kernel.lengthscale.detach().numpy()[0]
+                ls_str = ", ".join([f"{ls:.3f}" for ls in lengthscale])
+                print(f"Iter {i+1:>4}/{args.epochs} - Loss: {loss.item():.3f} | GP Lengthscales: [{ls_str}]")
+
+    print("\nTraining complete.")
+    predict_and_plot_grid(model, ds, mlp_feats, gp_feats, feature_stats, args.min_age, args.max_age)
+
+if __name__ == "__main__":
+    main()

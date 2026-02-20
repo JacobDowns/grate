@@ -34,7 +34,6 @@ class DataDrivenGP(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_pred, covar_pred)
 
 # --- 2. Data Loading & Feature Engineering ---
-# (Kept exactly identical to the previous script for mathematical consistency)
 
 def filter_age_data(df: pd.DataFrame, cosmogenic_only: bool, min_quality: str) -> pd.DataFrame:
     out = df.copy()
@@ -68,44 +67,38 @@ def prepare_training_tensors(
     ds: xr.Dataset, df: pd.DataFrame, mlp_features: list, gp_features: list,
     min_age: float, max_age: float, ages_bp_ref_year: float, model_bp_ref_year: float
 ):
-    x_obs = df["x_3413"].to_numpy(dtype=np.float32)
-    y_obs = df["y_3413"].to_numpy(dtype=np.float32)
+    x_obs, y_obs = df["x_3413"].to_numpy(dtype=np.float32), df["y_3413"].to_numpy(dtype=np.float32)
     ages_raw = df["age_mean"].to_numpy(dtype=np.float32)
     errs_raw = df["age_sd"].to_numpy(dtype=np.float32)
 
     ages_shifted = ages_raw - np.float32(float(ages_bp_ref_year) - float(model_bp_ref_year))
-    ages_norm = (ages_shifted - min_age) / (max_age - min_age)
-    ages_norm = np.clip(ages_norm, 0, 1)
+    ages_norm = np.clip((ages_shifted - min_age) / (max_age - min_age), 0, 1)
     errs_norm = errs_raw / (max_age - min_age)
 
-    x_xr = xr.DataArray(x_obs, dims="points")
-    y_xr = xr.DataArray(y_obs, dims="points")
-    ds_sampled = ds.interp(x=x_xr, y=y_xr, method="linear")
+    ds_sampled = ds.interp(x=xr.DataArray(x_obs, dims="points"), y=xr.DataArray(y_obs, dims="points"), method="linear")
     
     valid_mask = np.isfinite(ages_norm)
     all_features = list(set(mlp_features + gp_features))
     
-    coords_raw = np.column_stack((x_obs, y_obs))
-    feature_stats = {}
     extracted_features = {}
-    
     for feat in all_features:
         feat_data = ds_sampled[feat].values.astype(np.float32)
         valid_mask &= np.isfinite(feat_data)
         extracted_features[feat] = feat_data
         
+    coords_raw = np.column_stack((x_obs, y_obs))
     coords_valid = coords_raw[valid_mask]
     coords_mean, coords_std = coords_valid.mean(axis=0), coords_valid.std(axis=0)
     coords_scaled = (coords_valid - coords_mean) / coords_std
-    feature_stats['coords'] = {'mean': coords_mean, 'std': coords_std}
-
+    
+    feature_stats = {'coords': {'mean': coords_mean, 'std': coords_std}}
     scaled_features = {}
     for feat in all_features:
         feat_valid = extracted_features[feat][valid_mask]
-        feat_mean, feat_std = float(np.nanmean(feat_valid)), float(np.nanstd(feat_valid))
-        if feat_std == 0: feat_std = 1.0
-        scaled_features[feat] = (feat_valid - feat_mean) / feat_std
-        feature_stats[feat] = {'mean': feat_mean, 'std': feat_std}
+        f_mean, f_std = float(np.nanmean(feat_valid)), float(np.nanstd(feat_valid))
+        if f_std == 0: f_std = 1.0
+        scaled_features[feat] = (feat_valid - f_mean) / f_std
+        feature_stats[feat] = {'mean': f_mean, 'std': f_std}
 
     mlp_tensor_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
     for feat in mlp_features: mlp_tensor_list.append(torch.tensor(scaled_features[feat][:, None], dtype=torch.float32))
@@ -130,9 +123,7 @@ def prepare_moraine_tensors(ds, df_moraines, mlp_features, gp_features, feature_
     all_features = list(set(mlp_features + gp_features))
     
     def extract_and_scale(x_coords, y_coords):
-        x_xr, y_xr = xr.DataArray(x_coords, dims="points"), xr.DataArray(y_coords, dims="points")
-        ds_sampled = ds.interp(x=x_xr, y=y_xr, method="linear")
-        
+        ds_sampled = ds.interp(x=xr.DataArray(x_coords, dims="points"), y=xr.DataArray(y_coords, dims="points"), method="linear")
         valid_mask = np.ones(len(x_coords), dtype=bool)
         scaled_dict = {}
         for feat in all_features:
@@ -145,7 +136,6 @@ def prepare_moraine_tensors(ds, df_moraines, mlp_features, gp_features, feature_
         
         mlp_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
         for feat in mlp_features: mlp_list.append(torch.tensor(scaled_dict[feat][:, None], dtype=torch.float32))
-        
         gp_list = [torch.tensor(coords_scaled, dtype=torch.float32)]
         for feat in gp_features: gp_list.append(torch.tensor(scaled_dict[feat][:, None], dtype=torch.float32))
         
@@ -197,7 +187,7 @@ def train_pinn_loop(
 def run_checkerboard_cv(
     train_x_mlp, train_x_gp, train_y, train_errs, feature_stats, 
     mx_mlp_fwd, mx_gp_fwd, mx_mlp_bwd, mx_gp_bwd, lambda_geom,
-    min_age, max_age, size, iterations
+    min_age, max_age, size, iterations, out_dir, show_plot
 ):
     coords_mean, coords_std = feature_stats['coords']['mean'], feature_stats['coords']['std']
     x_coords = (train_x_mlp[:, 0].numpy() * coords_std[0]) + coords_mean[0]
@@ -210,10 +200,7 @@ def run_checkerboard_cv(
     
     cv_x, cv_y, cv_true, cv_pred = [], [], [], []
     
-    for idx, (tr_mask, te_mask, name) in enumerate([
-        (mask_A, mask_B, "Fold 1"), 
-        (mask_B, mask_A, "Fold 2")
-    ]):
+    for tr_mask, te_mask, name in [(mask_A, mask_B, "Fold 1"), (mask_B, mask_A, "Fold 2")]:
         if np.sum(tr_mask) == 0 or np.sum(te_mask) == 0: continue
             
         print(f"\n--- Running CV: {name} (Train: {np.sum(tr_mask)}, Test: {np.sum(te_mask)}) ---")
@@ -248,9 +235,7 @@ def run_checkerboard_cv(
         mse, cod = get_metrics(true_age_yrs, pred_age_yrs)
         print(f"  Result -> RMSE: {np.sqrt(mse):.0f} yrs | R^2: {cod:.3f}")
         
-    # --- New Unified Spatial CV Map ---
-    cv_x, cv_y = np.array(cv_x), np.array(cv_y)
-    cv_true, cv_pred = np.array(cv_true), np.array(cv_pred)
+    cv_x, cv_y, cv_true, cv_pred = np.array(cv_x), np.array(cv_y), np.array(cv_true), np.array(cv_pred)
     sq_errors = (cv_pred - cv_true)**2
     mse_total, cod_total = get_metrics(cv_true, cv_pred)
 
@@ -266,10 +251,9 @@ def run_checkerboard_cv(
     axes[0].grid(True, linestyle=':', alpha=0.6)
 
     # Right: Spatial MSE Map with Checkerboard Overlay
-    vmax_cap = np.percentile(sq_errors, 95) # Cap colors at 95th percentile to prevent blowout from 1 outlier
+    vmax_cap = np.percentile(sq_errors, 95)
     sc = axes[1].scatter(cv_x, cv_y, c=sq_errors, cmap='Reds', s=40, edgecolors='k', linewidth=0.5, vmin=0, vmax=vmax_cap)
     
-    # Draw Grid Lines
     x_grids = np.arange(np.floor(cv_x.min()/size)*size, np.ceil(cv_x.max()/size)*size + size, size)
     y_grids = np.arange(np.floor(cv_y.min()/size)*size, np.ceil(cv_y.max()/size)*size + size, size)
     for xg in x_grids: axes[1].axvline(xg, color='gray', linestyle='--', alpha=0.5, zorder=0)
@@ -281,18 +265,26 @@ def run_checkerboard_cv(
     plt.colorbar(sc, ax=axes[1], label="Squared Error (Years^2)")
 
     plt.tight_layout()
-    plt.show()
+    
+    # Save the High-Res Plot
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "cv_spatial_errors.png"
+    fig.savefig(out_path, dpi=300, bbox_inches='tight')
+    print(f"\n[+] Saved high-res CV plot to: {out_path}")
+    
+    if show_plot: plt.show()
+    else: plt.close(fig)
 
-# --- 4. Final Grid Prediction & GeoTIFF Export ---
+# --- 4. Final Grid Prediction & Output Export ---
 
-def predict_and_export_grid(model, ds, args, feature_stats, min_age, max_age):
+def predict_and_export_grid(model, ds, args, feature_stats, min_age, max_age, out_dir):
     model.eval()
     xg, yg = ds["x"].values, ds["y"].values
     X_grid, Y_grid = np.meshgrid(xg, yg)
     X_flat, Y_flat = X_grid.flatten(), Y_grid.flatten()
 
-    all_features = list(set(args.mlp_features + args.gp_features))
     valid_mask = np.ones_like(X_flat, dtype=bool)
+    all_features = list(set(args.mlp_features + args.gp_features))
     flat_features = {}
     
     for feat in all_features:
@@ -300,7 +292,7 @@ def predict_and_export_grid(model, ds, args, feature_stats, min_age, max_age):
         valid_mask &= np.isfinite(feat_flat)
         flat_features[feat] = feat_flat
 
-    if "thickness" in ds: ice_mask = ds["thickness"].values.flatten() > 10.0
+    if "thickness" in ds: ice_mask = ds["thickness"].values.flatten() > 0.0
     elif "ice_mask" in ds: ice_mask = ds["ice_mask"].values.flatten() == 1
     else: ice_mask = np.zeros_like(X_flat, dtype=bool)
     valid_mask &= ~ice_mask
@@ -340,25 +332,20 @@ def predict_and_export_grid(model, ds, args, feature_stats, min_age, max_age):
     unc_map[valid_mask] = uncertainty_years
     unc_map = unc_map.reshape(X_grid.shape)
 
-    # Export to GeoTIFF if rioxarray is available and requested
-    if HAS_RIOXARRAY and args.export_dir is not None:
-        out_path = Path(args.export_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        print(f"\nExporting GeoTIFFs to {out_path}...")
-        
+    # Export to GeoTIFF 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if HAS_RIOXARRAY:
+        print(f"\n[+] Exporting GeoTIFFs to {out_dir}/ ...")
         da_age = xr.DataArray(age_map, coords=[("y", yg), ("x", xg)], dims=["y", "x"], name="age_mean_yrs")
         da_unc = xr.DataArray(unc_map, coords=[("y", yg), ("x", xg)], dims=["y", "x"], name="age_std_yrs")
-        
-        # Write CRS and save
-        da_age.rio.write_crs("EPSG:3413", inplace=True).rio.to_raster(out_path / "predicted_age.tif")
-        da_unc.rio.write_crs("EPSG:3413", inplace=True).rio.to_raster(out_path / "predicted_uncertainty.tif")
-        print("GeoTIFF export complete.")
+        da_age.rio.write_crs("EPSG:3413", inplace=True).rio.to_raster(out_dir / "predicted_age.tif")
+        da_unc.rio.write_crs("EPSG:3413", inplace=True).rio.to_raster(out_dir / "predicted_uncertainty.tif")
 
-    # 1x2 Plotting
+    # Final Map Plotting
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     
-    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap="turbo_r", shading="auto", vmin=0, vmax=max_age)
-    axes[0].set_title("Full Model Prediction (Age BP)")
+    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap="seismic_r", shading="auto", vmin=0, vmax=max_age)
+    axes[0].set_title("Final Model Prediction (Age BP)")
     axes[0].set_aspect('equal')
     axes[0].set_facecolor('lightgray')
     plt.colorbar(im1, ax=axes[0], label="Age (Years)")
@@ -370,7 +357,14 @@ def predict_and_export_grid(model, ds, args, feature_stats, min_age, max_age):
     plt.colorbar(im2, ax=axes[1], label="Uncertainty (Years)")
     
     plt.tight_layout()
-    plt.show()
+    
+    # Save the High-Res Plot
+    out_path = out_dir / "final_prediction_maps.png"
+    fig.savefig(out_path, dpi=300, bbox_inches='tight')
+    print(f"[+] Saved high-res map plot to: {out_path}")
+    
+    if args.show: plt.show()
+    else: plt.close(fig)
 
 # --- 5. Main Execution ---
 
@@ -383,25 +377,26 @@ def main() -> None:
     parser.add_argument("--mlp-features", nargs="*", default=["signed_distance_to_margin"])
     parser.add_argument("--gp-features", nargs="*", default=["bed_elevation"])
     
-    parser.add_argument("--lambda-geom", type=float, default=1.0)
+    parser.add_argument("--lambda-geom", type=float, default=10.0)
     parser.add_argument("--moraine-step", type=float, default=500.0)
     parser.add_argument("--moraine-frac", type=float, default=1.0)
     
     parser.add_argument("--cosmogenic-only", action="store_true")
-    parser.add_argument("--min-quality", type=str, default="Low", choices=["High", "Mid", "Low"])
+    parser.add_argument("--min-quality", type=str, default="Med", choices=["High", "Mid", "Low"])
     parser.add_argument("--min-age", type=float, default=0.0)
     parser.add_argument("--max-age", type=float, default=15000.0)
     parser.add_argument("--ages-bp-ref-year", type=float, default=1950.0)
     parser.add_argument("--model-bp-ref-year", type=float, default=1850.0)
     
     parser.add_argument("--checkerboard-cv", action="store_true")
-    parser.add_argument("--checkerboard-size", type=float, default=66000.0)
+    parser.add_argument("--checkerboard-size", type=float, default=120000.0)
     parser.add_argument("--epochs", type=int, default=750)
     
-    # NEW ARGUMENTS FOR I/O
+    # OUTPUT AND I/O FLAGS
+    parser.add_argument("--out-dir", type=Path, default=Path("output"), help="Directory for all plots and GeoTIFFs")
     parser.add_argument("--save-model", type=str, default=None, help="Path to save the trained PyTorch state_dict (.pth)")
     parser.add_argument("--load-model", type=str, default=None, help="Path to load a pre-trained state_dict (.pth) and skip training")
-    parser.add_argument("--export-dir", type=str, default=None, help="Directory to save output GeoTIFFs (requires rioxarray)")
+    parser.add_argument("--show", action=argparse.BooleanOptionalAction, default=True, help="Show interactive plot windows (use --no-show for headless runs)")
 
     args = parser.parse_args()
     mlp_feats = args.mlp_features if args.mlp_features else []
@@ -427,13 +422,13 @@ def main() -> None:
         run_checkerboard_cv(
             train_x_mlp, train_x_gp, train_y, train_errs, feature_stats,
             mx_mlp_fwd, mx_gp_fwd, mx_mlp_bwd, mx_gp_bwd, args.lambda_geom,
-            args.min_age, args.max_age, args.checkerboard_size, args.epochs
+            args.min_age, args.max_age, args.checkerboard_size, args.epochs, 
+            args.out_dir, args.show
         )
 
     likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(noise=train_errs**2, learn_additional_noise=True)
     model = DataDrivenGP(train_x_mlp, train_x_gp, train_y, likelihood)
     
-    # Checkpoint Logic
     if args.load_model:
         print(f"\nLoading pre-trained model from {args.load_model}...")
         model.load_state_dict(torch.load(args.load_model))
@@ -456,7 +451,7 @@ def main() -> None:
             torch.save(model.state_dict(), args.save_model)
 
     print("\nGenerating final maps...")
-    predict_and_export_grid(model, ds, args, feature_stats, args.min_age, args.max_age)
+    predict_and_export_grid(model, ds, args, feature_stats, args.min_age, args.max_age, args.out_dir)
 
 if __name__ == "__main__":
     main()

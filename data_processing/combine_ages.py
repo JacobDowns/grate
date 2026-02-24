@@ -151,6 +151,7 @@ def summarize_radiocarbon_rows(
     lon_col: str,
     age_col: str,
     sd_col: str,
+    sd_sigma: float,
     quality_col: str | None,
     default_quality: str,
 ) -> pd.DataFrame:
@@ -165,10 +166,22 @@ def summarize_radiocarbon_rows(
     out[age_col] = pd.to_numeric(out[age_col], errors="coerce")
     out[sd_col] = pd.to_numeric(out[sd_col], errors="coerce")
 
+    if not np.isfinite(sd_sigma) or sd_sigma <= 0:
+        raise ValueError(f"Expected radiocarbon sd_sigma to be a positive finite number; got {sd_sigma!r}")
+
+    # Radiocarbon errors in our source CSV are reported as N-sigma (commonly 2σ). Convert to 1σ.
+    sd_1sigma = out[sd_col] / float(sd_sigma)
+
     if quality_col is not None and quality_col in out.columns:
         quality = out[quality_col]
     else:
         quality = pd.Series([default_quality] * int(out.shape[0]))
+
+    if float(sd_sigma) == 1.0:
+        sd_kind = "reported_sd"
+    else:
+        sigma_label = f"{sd_sigma:g}"
+        sd_kind = f"reported_{sigma_label}sigma_scaled_to_1sigma"
 
     obs = pd.DataFrame(
         {
@@ -177,11 +190,11 @@ def summarize_radiocarbon_rows(
             "lat": out[lat_col],
             "lon": out[lon_col],
             "age_mean": out[age_col],
-            "age_sd": out[sd_col],
-            "age_sd_kind": "reported_sd",
+            "age_sd": sd_1sigma,
+            "age_sd_kind": sd_kind,
             "age_sample_std": float("nan"),
             "age_standard_error": float("nan"),
-            "n_errors_used": out[sd_col].notna().astype(int),
+            "n_errors_used": sd_1sigma.notna().astype(int),
             "obs_type": "radiocarbon",
             "quality": quality,
         }
@@ -253,6 +266,15 @@ def main() -> None:
     parser.add_argument("--carbon-age-col", type=str, default="age_mean", help="Radiocarbon age mean column name.")
     parser.add_argument("--carbon-sd-col", type=str, default="age_std", help="Radiocarbon SD column name.")
     parser.add_argument(
+        "--carbon-sd-sigma",
+        type=float,
+        default=2.0,
+        help=(
+            "Sigma level of radiocarbon uncertainties in the input CSV (default: 2.0). "
+            "Set to 1.0 if your radiocarbon errors are already 1σ."
+        ),
+    )
+    parser.add_argument(
         "--carbon-quality-col",
         type=str,
         default="quality",
@@ -289,6 +311,7 @@ def main() -> None:
             lon_col=str(args.carbon_lon_col),
             age_col=str(args.carbon_age_col),
             sd_col=str(args.carbon_sd_col),
+            sd_sigma=float(args.carbon_sd_sigma),
             quality_col=str(args.carbon_quality_col) if carbon_quality_col else None,
             default_quality=str(args.carbon_default_quality),
         )
@@ -305,4 +328,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

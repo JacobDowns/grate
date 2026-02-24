@@ -6,6 +6,33 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from shapely.geometry import LineString, MultiLineString
+import torch 
+import torch.nn as nn
+
+class SecondOrderPolyMean(nn.Module):
+    def __init__(self, input_dim):
+        super(SecondOrderPolyMean, self).__init__()
+        # Number of terms: linear (D) + squared (D) + cross terms (D * (D - 1) / 2)
+        self.poly_dim = input_dim * 2 + (input_dim * (input_dim - 1)) // 2
+        self.linear = nn.Linear(self.poly_dim, 1)
+
+    def forward(self, x):
+        # x shape is (..., D). We support arbitrary batch shapes for GPyTorch.
+        input_dim = x.shape[-1]
+        
+        terms = [x, x ** 2]
+        
+        # Calculate cross-interaction terms (e.g., x1*x2, x1*x3...)
+        cross_terms = []
+        for i in range(input_dim):
+            for j in range(i + 1, input_dim):
+                cross_terms.append((x[..., i] * x[..., j]).unsqueeze(-1))
+                
+        if cross_terms:
+            terms.append(torch.cat(cross_terms, dim=-1))
+            
+        poly_x = torch.cat(terms, dim=-1)
+        return self.linear(poly_x).squeeze(-1)
 
 def extract_tangents(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
     records = []

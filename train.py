@@ -12,6 +12,7 @@ from pathlib import Path
 import argparse
 import pandas as pd
 from tqdm import tqdm
+import palettable.cubehelix as ch
 
 try:
     import rioxarray
@@ -37,6 +38,77 @@ class MLPMean(nn.Module):
 
     def forward(self, x):
         return self.mlp(x).squeeze(-1)
+    
+class WarpingNetwork(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super(WarpingNetwork, self).__init__()
+        # A tiny network to stretch/squish the spatial features
+        self.warper = nn.Sequential(
+            nn.Linear(input_dim, 16),
+            nn.Tanh(), # Tanh is smooth and strictly bounded, preventing exploded spaces
+            nn.Linear(16, latent_dim)
+        )
+        
+    def forward(self, x):
+        return self.warper(x)
+
+
+class GatedPiecewiseMean(nn.Module):
+    def __init__(self, input_dim, dist_idx=2):
+        super(GatedPiecewiseMean, self).__init__()
+        
+        # 1. Base Continuous Retreat (The Poly2 structure)
+        self.poly_dim = input_dim * 2 + (input_dim * (input_dim - 1)) // 2
+        self.base_linear = nn.Linear(self.poly_dim, 1)
+        
+        # 2. The Temporal Jump Parameters
+        # jump_magnitude: How many scaled years of history were erased?
+        self.jump_magnitude = nn.Parameter(torch.tensor(0.0))
+        # jump_threshold: At what scaled distance does the readvance moraine sit?
+        self.jump_threshold = nn.Parameter(torch.tensor(0.0))
+        
+        # 3. The Spatial Gate (Determines WHERE the readvance happened)
+        # Takes in only scaled x and y (indices 0 and 1)
+        self.spatial_gate = nn.Sequential(
+            nn.Linear(2, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+            nn.Sigmoid() # Squashes output to exactly [0, 1]
+        )
+        
+        # Which column in train_x_mlp is 'signed_distance_to_margin'?
+        # By default, [x, y, dist, bed] means dist is index 2.
+        self.dist_idx = dist_idx
+
+    def forward(self, x):
+        input_dim = x.shape[-1]
+        
+        # --- A. Calculate Base Polynomial ---
+        terms = [x, x ** 2]
+        cross_terms = []
+        for i in range(input_dim):
+            for j in range(i + 1, input_dim):
+                cross_terms.append((x[..., i] * x[..., j]).unsqueeze(-1))
+        if cross_terms:
+            terms.append(torch.cat(cross_terms, dim=-1))
+            
+        poly_x = torch.cat(terms, dim=-1)
+        base_pred = self.base_linear(poly_x).squeeze(-1)
+        
+        # --- B. Calculate the Discontinuity Jump ---
+        dist = x[..., self.dist_idx]
+        # Sharp sigmoid acts as a differentiable step function.
+        # If dist > threshold, step approaches 1. If dist < threshold, step approaches 0.
+        sharpness = 15.0 
+        step = torch.sigmoid(sharpness * (dist - self.jump_threshold))
+        
+        # --- C. Calculate the Spatial Gate ---
+        coords = x[..., 0:2]
+        gate = self.spatial_gate(coords).squeeze(-1)
+        
+        # --- D. Final Prediction ---
+        # Base retreat + (Jump Size * Is_Past_Distance_Threshold * Did_Readvance_Happen_Here)
+        return base_pred + (self.jump_magnitude * step * gate)
 
 class SecondOrderPolyMean(nn.Module):
     def __init__(self, input_dim):
@@ -67,6 +139,10 @@ class DataDrivenGP(gpytorch.models.ExactGP):
             self.mean_module = MLPMean(input_dim=train_x_mlp.shape[1])
         elif mean_type.lower() == "poly2":
             self.mean_module = SecondOrderPolyMean(input_dim=train_x_mlp.shape[1])
+        elif mean_type.lower() == "gated_piecewise":
+            # Assuming signed_distance_to_margin is the first feature you pass in args.mlp_features, 
+            # it will sit at index 2 (after scaled x and scaled y).
+            self.mean_module = GatedPiecewiseMean(input_dim=train_x_mlp.shape[1], dist_idx=2)
         else:
             self.mean_module = gpytorch.means.LinearMean(input_size=train_x_mlp.shape[1], bias=True)
     
@@ -118,6 +194,13 @@ def compute_dynamic_features(ds: xr.Dataset, requested_features: list):
         c2 = ndimage.uniform_filter(bed * bed, size=3)
         roughness = np.sqrt(np.clip(c2 - c1 * c1, 0, None))
         ds["bed_roughness"] = (("y", "x"), roughness.astype(np.float32))
+    if "bed_curvature" in requested_features and "bed_curvature" not in ds:
+        print("  -> Computing dynamic feature: bed_curvature")
+        # We use a larger sigma (e.g., 2.0 or 3.0) to aggressively smooth 
+        # out high-frequency DEM radar noise before taking the 2nd derivative!
+        curvature = ndimage.gaussian_laplace(bed, sigma=2.0)
+        ds["bed_curvature"] = (("y", "x"), curvature.astype(np.float32))
+
     return ds
 
 def generate_pseudo_margin_points(ds: xr.Dataset, n_points: int, assumed_age: float = 0.0, assumed_sd: float = 100.0):
@@ -322,7 +405,7 @@ def run_checkerboard_cv(
         model = DataDrivenGP(tx_mlp, tx_gp, ty, likelihood, mean_type=mean_type)
         model.covar_module.base_kernel.lengthscale = torch.tensor([[0.5] * tx_gp.shape[1]])
         
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
         
         with gpytorch.settings.max_cg_iterations(2000), gpytorch.settings.cholesky_jitter(1e-4):
@@ -615,7 +698,8 @@ def predict_and_export_grid(model, ds, args, feature_stats, clip_min, clip_max, 
         da_unc.rio.write_crs("EPSG:3413", inplace=True).rio.to_raster(out_dir / "predicted_uncertainty.tif")
 
     fig1, axes = plt.subplots(1, 2, figsize=(16, 8))
-    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap="turbo_r", shading="auto", vmin=clip_min, vmax=clip_max)
+    
+    im1 = axes[0].pcolormesh(X_grid, Y_grid, age_map, cmap='seismic_r', shading="auto", vmin=clip_min, vmax=clip_max)
     axes[0].set_title(f"Final Model Prediction\n(Mean Architecture: {mean_type.upper()})")
     axes[0].set_aspect('equal')
     axes[0].set_facecolor('lightgray')
@@ -628,12 +712,12 @@ def predict_and_export_grid(model, ds, args, feature_stats, clip_min, clip_max, 
     plt.colorbar(im2, ax=axes[1], label="Uncertainty (Years)")
     
     plt.tight_layout()
-    fig1.savefig(out_dir / "final_prediction_maps.png", dpi=300, bbox_inches='tight')
+    fig1.savefig(out_dir / "final_prediction_maps.png", dpi=500, bbox_inches='tight')
     
     print("\nGenerating Isochrone Alignment Map...")
     fig2, ax_iso = plt.subplots(figsize=(10, 10))
     
-    step = 2000
+    step = 1000
     levels = np.arange(0, clip_max + step, step)
     cmap_discrete = plt.get_cmap("turbo_r")
     norm = mcolors.BoundaryNorm(levels, ncolors=cmap_discrete.N, clip=True)
@@ -689,10 +773,10 @@ def main() -> None:
     parser.add_argument("--ages_path", type=Path, default=Path("data/age_data/combined_ages.csv"))
     parser.add_argument("--moraines_path", type=Path, default=Path("data/age_data/moraine_tangents.csv"))
     
-    parser.add_argument("--mlp-features", nargs="*", default=["signed_distance_to_margin"])
+    parser.add_argument("--mlp-features", nargs="*", default=["signed_distance_to_margin", "distance_to_coast"])
     parser.add_argument("--gp-features", nargs="*", default=["bed_elevation"])
     
-    parser.add_argument("--mean-type", type=str, default="linear", choices=["linear", "mlp", "poly2"], help="Select the mean function architecture.")
+    parser.add_argument("--mean-type", type=str, default="linear", choices=["linear", "mlp", "poly2", "gated_piecewise"])
     
     parser.add_argument("--lambda-geom", type=float, default=10.0)
     parser.add_argument("--moraine-step", type=float, default=500.0)
@@ -715,7 +799,7 @@ def main() -> None:
     parser.add_argument("--checkerboard-cv", action="store_true", help="Run 2-Fold Checkerboard CV")
     parser.add_argument("--lobo-cv", action="store_true", help="Run exhaustive Leave-One-Block-Out CV")
     parser.add_argument("--checkerboard-size", type=float, default=120000.0)
-    parser.add_argument("--epochs", type=int, default=750)
+    parser.add_argument("--epochs", type=int, default=2000)
     
     parser.add_argument("--out-dir", type=Path, default=Path("output"), help="Directory for all plots and GeoTIFFs")
     parser.add_argument("--save-model", type=str, default=None, help="Path to save the trained PyTorch state_dict (.pth)")
@@ -786,7 +870,7 @@ def main() -> None:
     else:
         print(f"\nStarting Final GP + {args.mean_type.upper()} Mean Training...")
         model.covar_module.base_kernel.lengthscale = torch.tensor([[0.5] * train_x_gp.shape[1]])
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
         mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
         
         with gpytorch.settings.max_cg_iterations(2000), gpytorch.settings.cholesky_jitter(1e-4):

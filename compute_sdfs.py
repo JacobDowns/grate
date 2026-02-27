@@ -308,7 +308,7 @@ def main() -> None:
     parser.add_argument(
         "--resolution-m",
         type=float,
-        default=1000.0,
+        default=250.0,
         help=(
             "Target output grid resolution (meters). Default 500. "
             "Set to 150 to keep native resolution, or any positive value."
@@ -323,7 +323,7 @@ def main() -> None:
     parser.add_argument(
         "--plot-downsample",
         type=int,
-        default=12,
+        default=2,
         help="Coarsening factor for plotting only (default: 12).",
     )
     args = parser.parse_args()
